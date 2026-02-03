@@ -519,6 +519,12 @@ async function handlePasteSubmit(form) {
     price: form.querySelector('#paste-price')?.value || '0',
     imageUrl: form.querySelector('#paste-image')?.value.trim() || '',
     visibleIn,
+    // Attributes
+    attributes: extractDynamicListItems(form, 'paste-product-attributes', ['code', 'type', 'value']),
+    // Meta tags
+    metaTitle: form.querySelector('#paste-meta-title')?.value.trim() || '',
+    metaDescription: form.querySelector('#paste-meta-description')?.value.trim() || '',
+    metaKeywords: form.querySelector('#paste-meta-keywords')?.value.trim() || '',
   };
 
   if (!formData.sku || !formData.name) {
@@ -533,6 +539,10 @@ async function handlePasteSubmit(form) {
     ...formData,
     shortDescription: formData.description,
     images: formData.imageUrl ? [{ url: formData.imageUrl, label: formData.name, roles: 'THUMBNAIL, BASE, SMALL' }] : [],
+    attributes: formData.attributes,
+    metaTitle: formData.metaTitle,
+    metaDescription: formData.metaDescription,
+    metaKeywords: formData.metaKeywords,
   });
   const pricePayload = buildPricePayload(formData.sku, formData.price, DEFAULT_PRICE_BOOK);
 
@@ -650,6 +660,60 @@ function openEditModal(product) {
       form.querySelector('#edit-product-short-description').value = product.shortDescription || '';
       form.querySelector('#edit-product-image').value = product.images?.[0]?.url || '';
       form.querySelector('#edit-product-description').value = product.description || '';
+
+      // Populate attributes
+      const attributesContainer = form.querySelector('#edit-product-attributes-list');
+      if (attributesContainer) {
+        // Clear existing attribute rows
+        attributesContainer.innerHTML = '';
+
+        // Add rows for each attribute
+        if (product.attributes && product.attributes.length > 0) {
+          product.attributes.forEach((attr) => {
+            const itemRow = createDynamicListItem('edit-product-attributes', [
+              { name: 'code', placeholder: 'Attribute code (e.g., brand)', type: 'text' },
+              {
+                name: 'type',
+                placeholder: 'Type',
+                type: 'select',
+                options: [
+                  { value: 'STRING', label: 'String' },
+                  { value: 'NUMBER', label: 'Number' },
+                  { value: 'BOOLEAN', label: 'Boolean' },
+                ],
+              },
+              { name: 'value', placeholder: 'Value', type: 'text' },
+            ]);
+
+            // Set values
+            const codeInput = itemRow.querySelector('input[name="edit-product-attributes-code"]');
+            const typeSelect = itemRow.querySelector('select[name="edit-product-attributes-type"]');
+            const valueInput = itemRow.querySelector('input[name="edit-product-attributes-value"]');
+
+            if (codeInput) codeInput.value = attr.code || attr.name || '';
+            if (typeSelect) typeSelect.value = attr.type || 'STRING';
+            if (valueInput) valueInput.value = attr.value || (attr.values && attr.values[0]) || '';
+
+            attributesContainer.appendChild(itemRow);
+          });
+        }
+      }
+
+      // Populate meta tags
+      if (product.metaTags) {
+        const metaTitleInput = form.querySelector('#edit-product-meta-title');
+        const metaDescInput = form.querySelector('#edit-product-meta-description');
+        const metaKeywordsInput = form.querySelector('#edit-product-meta-keywords');
+
+        if (metaTitleInput) metaTitleInput.value = product.metaTags.title || '';
+        if (metaDescInput) metaDescInput.value = product.metaTags.description || '';
+        if (metaKeywordsInput && product.metaTags.keywords) {
+          // Convert keywords array back to comma-separated string
+          metaKeywordsInput.value = Array.isArray(product.metaTags.keywords)
+            ? product.metaTags.keywords.join(', ')
+            : product.metaTags.keywords;
+        }
+      }
     }
 
     modal.classList.add('is-open');
@@ -692,12 +756,37 @@ function buildProductUpdatePayload(sku, formData) {
     }];
   }
 
-  // Handle category as attribute
+  // Handle category as attribute with proper ACO format
   if (formData.category) {
-    payload.attributes = [{
-      name: 'category',
-      value: formData.category,
-    }];
+    payload.attributes = payload.attributes || [];
+    payload.attributes.push({
+      code: 'category',
+      type: 'STRING',
+      values: [formData.category],
+    });
+  }
+
+  // Handle additional attributes if provided
+  if (formData.attributes && formData.attributes.length > 0) {
+    payload.attributes = payload.attributes || [];
+    formData.attributes.forEach((attr) => {
+      payload.attributes.push({
+        code: attr.code,
+        type: attr.type || 'STRING',
+        values: Array.isArray(attr.values) ? attr.values : [attr.value || attr.values],
+      });
+    });
+  }
+
+  // Handle meta tags
+  if (formData.metaTitle || formData.metaDescription || formData.metaKeywords) {
+    payload.metaTags = {};
+    if (formData.metaTitle) payload.metaTags.title = formData.metaTitle;
+    if (formData.metaDescription) payload.metaTags.description = formData.metaDescription;
+    if (formData.metaKeywords) {
+      // Split comma-separated keywords into array
+      payload.metaTags.keywords = formData.metaKeywords.split(',').map((k) => k.trim()).filter((k) => k);
+    }
   }
 
   return payload;
@@ -856,6 +945,11 @@ async function handleProductUpdate(form) {
     shortDescription: form.querySelector('#edit-product-short-description').value.trim(),
     description: form.querySelector('#edit-product-description').value.trim(),
     imageUrl: form.querySelector('#edit-product-image').value.trim(),
+    attributes: extractDynamicListItems(form, 'edit-product-attributes', ['code', 'type', 'value']),
+    // Meta tags
+    metaTitle: form.querySelector('#edit-product-meta-title')?.value.trim() || '',
+    metaDescription: form.querySelector('#edit-product-meta-description')?.value.trim() || '',
+    metaKeywords: form.querySelector('#edit-product-meta-keywords')?.value.trim() || '',
   };
 
   const sku = modalState.editingProduct.sku;
@@ -1121,6 +1215,35 @@ function createPasteModal() {
   visibilityGroup.appendChild(checkboxContainer);
   rightColumn.appendChild(visibilityGroup);
 
+  // Attributes section
+  const attributesSection = createFormSection('Attributes');
+  const attributesList = createDynamicListSection('paste-product-attributes', '', [
+    { name: 'code', placeholder: 'Attribute code (e.g., brand)', type: 'text' },
+    {
+      name: 'type',
+      placeholder: 'Type',
+      type: 'select',
+      options: [
+        { value: 'STRING', label: 'String' },
+        { value: 'NUMBER', label: 'Number' },
+        { value: 'BOOLEAN', label: 'Boolean' },
+      ],
+    },
+    { name: 'value', placeholder: 'Value', type: 'text' },
+  ], 'Add Attribute');
+  attributesSection.appendChild(attributesList);
+  rightColumn.appendChild(attributesSection);
+
+  // Meta Tags section
+  const metaTagsSection = createFormSection('SEO / Meta Tags');
+  const metaTitleGroup = createFormGroup('paste-meta-title', 'Meta Title', 'text', 'SEO title for search engines');
+  const metaDescGroup = createFormGroup('paste-meta-description', 'Meta Description', 'text', 'SEO description for search engines');
+  const metaKeywordsGroup = createFormGroup('paste-meta-keywords', 'Meta Keywords', 'text', 'keyword1, keyword2, keyword3 (comma separated)');
+  metaTagsSection.appendChild(metaTitleGroup);
+  metaTagsSection.appendChild(metaDescGroup);
+  metaTagsSection.appendChild(metaKeywordsGroup);
+  rightColumn.appendChild(metaTagsSection);
+
   columnsContainer.appendChild(leftColumn);
   columnsContainer.appendChild(rightColumn);
   form.appendChild(columnsContainer);
@@ -1345,6 +1468,33 @@ function createEditModal() {
   descGroup.appendChild(descLabel);
   descGroup.appendChild(descTextarea);
 
+  // Attributes section
+  const attributesSection = createFormSection('Attributes');
+  const attributesList = createDynamicListSection('edit-product-attributes', '', [
+    { name: 'code', placeholder: 'Attribute code (e.g., brand)', type: 'text' },
+    {
+      name: 'type',
+      placeholder: 'Type',
+      type: 'select',
+      options: [
+        { value: 'STRING', label: 'String' },
+        { value: 'NUMBER', label: 'Number' },
+        { value: 'BOOLEAN', label: 'Boolean' },
+      ],
+    },
+    { name: 'value', placeholder: 'Value', type: 'text' },
+  ], 'Add Attribute');
+  attributesSection.appendChild(attributesList);
+
+  // Meta Tags section
+  const metaTagsSection = createFormSection('SEO / Meta Tags');
+  const metaTitleGroup = createFormGroup('edit-product-meta-title', 'Meta Title', 'text', 'SEO title for search engines');
+  const metaDescGroup = createFormGroup('edit-product-meta-description', 'Meta Description', 'text', 'SEO description for search engines');
+  const metaKeywordsGroup = createFormGroup('edit-product-meta-keywords', 'Meta Keywords', 'text', 'keyword1, keyword2, keyword3 (comma separated)');
+  metaTagsSection.appendChild(metaTitleGroup);
+  metaTagsSection.appendChild(metaDescGroup);
+  metaTagsSection.appendChild(metaKeywordsGroup);
+
   form.appendChild(skuGroup);
   form.appendChild(nameGroup);
   form.appendChild(priceGroup);
@@ -1352,6 +1502,8 @@ function createEditModal() {
   form.appendChild(shortDescGroup);
   form.appendChild(imageGroup);
   form.appendChild(descGroup);
+  form.appendChild(attributesSection);
+  form.appendChild(metaTagsSection);
 
   body.appendChild(form);
 
@@ -2280,6 +2432,47 @@ function createProductCard(product) {
 
     attrsContainer.appendChild(attrsList);
     info.appendChild(attrsContainer);
+  }
+
+  // Meta Tags
+  if (product.metaTags && (product.metaTags.title || product.metaTags.description || product.metaTags.keywords)) {
+    const metaContainer = document.createElement('div');
+    metaContainer.className = 'plp-product-metatags';
+
+    const metaTitle = document.createElement('p');
+    metaTitle.className = 'plp-product-metatags-title';
+    metaTitle.textContent = 'Meta Tags';
+    metaContainer.appendChild(metaTitle);
+
+    const metaList = document.createElement('ul');
+    metaList.className = 'plp-product-metatags-list';
+
+    if (product.metaTags.title) {
+      const titleItem = document.createElement('li');
+      titleItem.className = 'plp-product-metatag';
+      titleItem.innerHTML = `<span class="meta-label">Title:</span> <span class="meta-value">${product.metaTags.title}</span>`;
+      metaList.appendChild(titleItem);
+    }
+
+    if (product.metaTags.description) {
+      const descItem = document.createElement('li');
+      descItem.className = 'plp-product-metatag';
+      descItem.innerHTML = `<span class="meta-label">Description:</span> <span class="meta-value">${product.metaTags.description}</span>`;
+      metaList.appendChild(descItem);
+    }
+
+    if (product.metaTags.keywords && product.metaTags.keywords.length > 0) {
+      const keywordsItem = document.createElement('li');
+      keywordsItem.className = 'plp-product-metatag';
+      const keywordsStr = Array.isArray(product.metaTags.keywords)
+        ? product.metaTags.keywords.join(', ')
+        : product.metaTags.keywords;
+      keywordsItem.innerHTML = `<span class="meta-label">Keywords:</span> <span class="meta-value">${keywordsStr}</span>`;
+      metaList.appendChild(keywordsItem);
+    }
+
+    metaContainer.appendChild(metaList);
+    info.appendChild(metaContainer);
   }
 
   card.appendChild(imageContainer);
