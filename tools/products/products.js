@@ -1,51 +1,298 @@
 import DA_SDK from 'https://da.live/nx/utils/sdk.js';
 
-// Constants
-const ACO_TENANT_ID = 'NZwP3wKPFXBCTLGqxYWZne';
-const ACO_BASE_URL = `https://na1-sandbox.api.commerce.adobe.com/${ACO_TENANT_ID}`;
+/**
+ * Same keys as aco-sample-catalog-data-ingestion `.env`, plus catalog view for GraphQL
+ * and optional default price book id for prices/search.
+ * Price-book **ingestion** uses the Data Ingestion REST API directly (equivalent to
+ * `@adobe-commerce/aco-ts-sdk` `createPriceBooks`); the SDK is not bundled in this tool.
+ * Values are read from localStorage first; non-secret URL parts fall back to demo defaults.
+ */
+const ACO_LS_KEYS = {
+  CLIENT_ID: 'CLIENT_ID',
+  CLIENT_SECRET: 'CLIENT_SECRET',
+  /** Bearer for Data Ingestion only; use when browser cannot call IMS (CORS). From Developer Console → Generate Access Token. */
+  INGESTION_ACCESS_TOKEN: 'INGESTION_ACCESS_TOKEN',
+  /** Epoch ms when INGESTION_ACCESS_TOKEN should be treated as expired (set from Fusion expires_in). */
+  INGESTION_ACCESS_TOKEN_EXPIRES_AT: 'INGESTION_ACCESS_TOKEN_EXPIRES_AT',
+  TENANT_ID: 'TENANT_ID',
+  REGION: 'REGION',
+  ENVIRONMENT: 'ENVIRONMENT',
+  CATALOG_VIEW_ID: 'CATALOG_VIEW_ID',
+  PRICE_BOOK_ID: 'PRICE_BOOK_ID',
+  /** Display name when creating a price book via Data Ingestion (optional; defaults to id). */
+  PRICE_BOOK_NAME: 'PRICE_BOOK_NAME',
+  /** ISO currency for create price book (optional; defaults to USD). */
+  PRICE_BOOK_CURRENCY: 'PRICE_BOOK_CURRENCY',
+};
 
-//https://na1-sandbox.api.commerce.adobe.com/{{tenantId}}/api/v1/catalog/products
-const ACO_URL = `${ACO_BASE_URL}/graphql`;
+/** commerce/settings.json row keys (often lowercase snake_case) → localStorage env names */
+const COMMERCE_SETTINGS_JSON_KEYS = {
+  client_id: ACO_LS_KEYS.CLIENT_ID,
+  client_secret: ACO_LS_KEYS.CLIENT_SECRET,
+  ingestion_access_token: ACO_LS_KEYS.INGESTION_ACCESS_TOKEN,
+  ingestion_access_token_expires_at: ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT,
+  tenant_id: ACO_LS_KEYS.TENANT_ID,
+  tenet_id: ACO_LS_KEYS.TENANT_ID,
+  region: ACO_LS_KEYS.REGION,
+  env: ACO_LS_KEYS.ENVIRONMENT,
+  environment: ACO_LS_KEYS.ENVIRONMENT,
+  catalog_view_id: ACO_LS_KEYS.CATALOG_VIEW_ID,
+  price_book_id: ACO_LS_KEYS.PRICE_BOOK_ID,
+  price_book_name: ACO_LS_KEYS.PRICE_BOOK_NAME,
+  price_book_currency: ACO_LS_KEYS.PRICE_BOOK_CURRENCY,
+};
 
-// TENANT_ID=NZwP3wKPFXBCTLGqxYWZne
-// REGION=na1
-// ENVIRONMENT=sandbox
-
-// ACO Ingestion API endpoints
-const ACO_PRODUCTS_ENDPOINT = `${ACO_BASE_URL}/v1/catalog/products`;
-const ACO_PRODUCTS_DELETE_ENDPOINT = `${ACO_BASE_URL}/v1/catalog/products/delete`;
-const ACO_PRICES_ENDPOINT = `${ACO_BASE_URL}/v1/catalog/products/prices`;
+const DEFAULT_TENANT_ID = 'NZwP3wKPFXBCTLGqxYWZne';
+const DEFAULT_REGION = 'na1';
+const DEFAULT_ENVIRONMENT = 'sandbox';
+const DEFAULT_CATALOG_VIEW_ID = '426ffe32-e0a9-4c53-8ec9-3f7118cbf6b2';
 
 const PAGE_SIZE = 25;
-const CATALOG_VIEW_ID = '426ffe32-e0a9-4c53-8ec9-3f7118cbf6b2';
 const DEFAULT_LOCALE = 'en-US';
-const DEFAULT_PRICE_BOOK = 'wknd_global';
-const ALL_PRICE_BOOKS = ['wknd_global', 'wknd_vip'];
+/** Fallback when PRICE_BOOK_ID is not set in Commerce settings */
+const DEFAULT_PRICE_BOOK_FALLBACK = 'wknd_global';
+/** Default currency for POST /v1/catalog/price-books (FeedPricebook) when settings field is empty */
+const DEFAULT_PRICE_BOOK_CURRENCY = 'USD';
+/** Same batch size as aco-sample-catalog-data-ingestion `index.js` (createPriceBooks per batch). */
+const PRICE_BOOKS_INGEST_BATCH_SIZE = 100;
+/** Extra ids kept in the catalog filter dropdown alongside your configured default */
+const SAMPLE_PRICE_BOOKS = ['wknd_global', 'wknd_vip'];
 
-// Adobe IMS credentials for authentication
-const IMS_CLIENT_ID = 'f2060b271ca64684abafbbc7ebec20d2';
-const IMS_CLIENT_SECRET = 'p8e-uiUt_S57xxu5xBKRJBLrEakl6NaTV43d';
-const IMS_TOKEN_ENDPOINT = 'https://ims-na1.adobelogin.com/ims/token/v3';
+/** Fusion hook: POST JSON `{ client_id }` to receive an ingestion bearer (avoids browser CORS to Adobe IMS). */
+const FUSION_INGESTION_TOKEN_HOOK_URL =
+  'https://hook.fusion.adobe.com/wrnqgcbprf11b1jqy9gw9acdt2crjgpj';
 
-// Store access token
+/**
+ * Paste-grid columns aligned with FeedProduct objects in
+ * https://github.com/adobe-commerce/aco-sample-catalog-data-ingestion/blob/main/data/products.json
+ * (plus price; price book for upload comes from Commerce settings PRICE_BOOK_ID).
+ */
+const PASTE_GRID_COLUMNS = [
+  { field: 'sku', header: 'SKU', placeholder: 'aur-flu-bat-mid-2013' },
+  { field: 'locale', header: 'Locale', placeholder: DEFAULT_LOCALE },
+  { field: 'name', header: 'Name', placeholder: 'Product name' },
+  { field: 'slug', header: 'Slug', placeholder: 'url-slug (optional)' },
+  { field: 'status', header: 'Status', placeholder: 'ENABLED' },
+  { field: 'shortDescription', header: 'Short description', textarea: true, rows: 2 },
+  { field: 'description', header: 'Description', textarea: true, rows: 3 },
+  { field: 'visibleIn', header: 'VisibleIn', placeholder: 'CATALOG,SEARCH' },
+  { field: 'metaTitle', header: 'Meta title', placeholder: 'metaTags.title' },
+  { field: 'metaDescription', header: 'Meta description', textarea: true, rows: 2 },
+  {
+    field: 'metaKeywords',
+    header: 'Meta keywords',
+    placeholder: 'comma-separated (JSON files use keywords[])',
+  },
+  { field: 'imageUrl', header: 'Image URL', inputType: 'url', placeholder: 'images[0].url' },
+  { field: 'imageLabel', header: 'Image label', placeholder: 'images[0].label' },
+  {
+    field: 'imageRoles',
+    header: 'Image roles',
+    placeholder: 'THUMBNAIL,BASE,SMALL',
+  },
+  {
+    field: 'attributesJson',
+    header: 'Attributes JSON',
+    textarea: true,
+    rows: 3,
+    placeholder: '[{"code":"brand","type":"STRING","values":["Aurora"]}]',
+  },
+  {
+    field: 'linksJson',
+    header: 'Links JSON',
+    textarea: true,
+    rows: 2,
+    placeholder: '[{"sku":"related-sku","type":"related"}]',
+  },
+  {
+    field: 'routesJson',
+    header: 'Routes JSON',
+    textarea: true,
+    rows: 2,
+    placeholder: '[{"path":"battery"},{"path":"battery/brand"}]',
+  },
+  { field: 'price', header: 'Price', placeholder: 'from prices.json / manual' },
+  {
+    field: 'priceBookId',
+    header: 'Price book',
+    placeholder: 'Ignored on upload — use Commerce settings',
+  },
+];
+
+/** When the paste grid Attributes JSON column is empty, ingestion still gets a minimal `brand` attribute. */
+const PASTE_GRID_DEFAULT_BRAND = 'Unknown';
+
+/**
+ * Best-effort brand label from a product title (e.g. "Tide Laundry Detergent, 3-in-1…" → "Tide").
+ */
+function guessBrandFromProductName(name) {
+  const raw = String(name || '').trim();
+  if (!raw) return '';
+
+  const beforeComma = raw.split(',')[0].trim();
+  const parts = beforeComma.split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < parts.length && /^(a|an|the)$/i.test(parts[i])) {
+    i += 1;
+  }
+  const w = parts[i] || '';
+  const cleaned = w.replace(/[^\w&'-]/g, '');
+  if (cleaned.length < 2) return '';
+  return cleaned;
+}
+
+function defaultBrandAttributesArray(brandValue) {
+  const v = String(brandValue || '').trim() || PASTE_GRID_DEFAULT_BRAND;
+  return [{ code: 'brand', type: 'STRING', values: [v] }];
+}
+
+function defaultBrandAttributesJson(brandValue) {
+  return JSON.stringify(defaultBrandAttributesArray(brandValue));
+}
+
+/** Allowed attribute `type` values for catalog ingestion (matches sample products.json). */
+const INGESTION_ATTRIBUTE_TYPES = new Set(['STRING', 'NUMBER', 'BOOLEAN', 'INTEGER', 'DECIMAL']);
+
+/**
+ * Coerce paste / form / JSON attribute rows to ingestion attributes: { code, type, values }.
+ * Fixes scalar `values` (e.g. "Tide") which previously became [""].
+ */
+function normalizeAttributesForIngestion(rawList) {
+  if (!Array.isArray(rawList) || rawList.length === 0) return [];
+
+  const out = [];
+  rawList.forEach((attr) => {
+    if (!attr || typeof attr !== 'object' || Array.isArray(attr)) return;
+
+    const code = String(attr.code ?? attr.name ?? attr.attribute_code ?? '').trim();
+    if (!code) return;
+
+    let values = [];
+    if (Array.isArray(attr.values)) {
+      values = attr.values.map((v) => (v == null ? '' : String(v).trim()));
+    } else if (attr.values !== undefined && attr.values !== null && String(attr.values).trim() !== '') {
+      values = [String(attr.values).trim()];
+    } else if (attr.value !== undefined && attr.value !== null && String(attr.value).trim() !== '') {
+      values = [String(attr.value).trim()];
+    }
+
+    values = values.filter((s) => s !== '');
+    if (!values.length) return;
+
+    const rawType = String(attr.type ?? 'STRING').trim().toUpperCase() || 'STRING';
+    const type = INGESTION_ATTRIBUTE_TYPES.has(rawType) ? rawType : 'STRING';
+
+    out.push({ code, type, values });
+  });
+  return out;
+}
+
+function readLocalStorageTrimmed(key) {
+  try {
+    const v = localStorage.getItem(key);
+    return v != null && String(v).trim() !== '' ? String(v).trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+/** Default `priceBookId` from Commerce settings: add-product form, paste-grid price upload, PLP filter default */
+function getDefaultPriceBook() {
+  return readLocalStorageTrimmed(ACO_LS_KEYS.PRICE_BOOK_ID) || DEFAULT_PRICE_BOOK_FALLBACK;
+}
+
+/** Price books shown in the PLP filter (your default first, then sample ids without duplicates). */
+function getPriceBookOptionsForFilter() {
+  const primary = getDefaultPriceBook();
+  const out = [primary];
+  SAMPLE_PRICE_BOOKS.forEach((pb) => {
+    if (!out.includes(pb)) out.push(pb);
+  });
+  return out;
+}
+
+/**
+ * REGION values from sheets/env often use short codes ("na"); IMS + Commerce API hosts expect na1, eu1, etc.
+ */
+function normalizeCommerceRegionForHosts(raw) {
+  const r = String(raw ?? '').trim().toLowerCase();
+  if (!r) return DEFAULT_REGION;
+  const shorthand = {
+    na: 'na1',
+    eu: 'eu1',
+    ap: 'ap1',
+    apac: 'ap1',
+    asia: 'ap1',
+    latam: 'la1',
+  };
+  return shorthand[r] || r;
+}
+
+/**
+ * Build Commerce Optimizer + IMS endpoints from localStorage (sample ingestion README shape).
+ */
+function buildAcoRuntimeConfig() {
+  const clientId = readLocalStorageTrimmed(ACO_LS_KEYS.CLIENT_ID);
+  const clientSecret = readLocalStorageTrimmed(ACO_LS_KEYS.CLIENT_SECRET);
+  const tenantIdLs = readLocalStorageTrimmed(ACO_LS_KEYS.TENANT_ID);
+  const regionLs = readLocalStorageTrimmed(ACO_LS_KEYS.REGION);
+  const environmentLs = readLocalStorageTrimmed(ACO_LS_KEYS.ENVIRONMENT);
+  const catalogViewLs = readLocalStorageTrimmed(ACO_LS_KEYS.CATALOG_VIEW_ID);
+
+  const tenantId = tenantIdLs || DEFAULT_TENANT_ID;
+  const region = normalizeCommerceRegionForHosts(regionLs || DEFAULT_REGION);
+  const environment = environmentLs || DEFAULT_ENVIRONMENT;
+  const catalogViewId = catalogViewLs || DEFAULT_CATALOG_VIEW_ID;
+
+  const acoBaseUrl = `https://${region}-${environment}.api.commerce.adobe.com/${tenantId}`;
+  const imsTokenUrl = `https://ims-${region}.adobelogin.com/ims/token/v3`;
+
+  return {
+    clientId,
+    clientSecret,
+    tenantId,
+    region,
+    environment,
+    catalogViewId,
+    catalogViewFromStorage: Boolean(catalogViewLs),
+    acoBaseUrl,
+    graphqlUrl: `${acoBaseUrl}/graphql`,
+    productsEndpoint: `${acoBaseUrl}/v1/catalog/products`,
+    productsDeleteEndpoint: `${acoBaseUrl}/v1/catalog/products/delete`,
+    pricesEndpoint: `${acoBaseUrl}/v1/catalog/products/prices`,
+    priceBooksEndpoint: `${acoBaseUrl}/v1/catalog/price-books`,
+    imsTokenUrl,
+    hasImsClientCredentials: Boolean(clientId && clientSecret),
+  };
+}
+
+let acoRuntime = buildAcoRuntimeConfig();
+
+// Store access token (DA SDK or IMS client credentials)
 let accessToken = null;
-let userProvidedToken = false; // Flag to track if user manually entered a token
 
 /**
  * Request an access token from Adobe IMS using client credentials
  * @returns {Promise<string>} The access token
  */
 async function requestAccessToken() {
+  if (!acoRuntime.hasImsClientCredentials) {
+    throw new Error(
+      'Missing CLIENT_ID or CLIENT_SECRET. Use Commerce settings to save them (same as sample repo .env).',
+    );
+  }
+
   console.log('Requesting access token from Adobe IMS...');
 
   const params = new URLSearchParams();
   params.append('grant_type', 'client_credentials');
-  params.append('client_id', IMS_CLIENT_ID);
-  params.append('client_secret', IMS_CLIENT_SECRET);
-  params.append('scope', 'openid,AdobeID,additional_info.projectedProductContext');
+  params.append('client_id', acoRuntime.clientId);
+  params.append('client_secret', acoRuntime.clientSecret);
+  // Data Ingestion API requires commerce.aco.ingestion (Adobe Developer project: Commerce Optimizer Ingestion API)
+  params.append('scope', 'openid,AdobeID,profile,email,commerce.aco.ingestion');
 
   try {
-    const response = await fetch(IMS_TOKEN_ENDPOINT, {
+    const response = await fetch(acoRuntime.imsTokenUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -66,24 +313,62 @@ async function requestAccessToken() {
     return data.access_token;
   } catch (error) {
     console.error('Error requesting access token:', error);
+    const isNetwork =
+      error instanceof TypeError ||
+      (typeof error?.message === 'string' && error.message.toLowerCase().includes('fetch'));
+    if (isNetwork) {
+      throw new Error(
+        `Could not reach Adobe IMS (${acoRuntime.imsTokenUrl}). `
+          + 'Browsers usually cannot call the IMS token endpoint from this page (CORS). '
+          + 'Use Commerce settings → INGESTION_ACCESS_TOKEN: in Developer Console open your Commerce Optimizer Ingestion project, '
+          + 'OAuth Server-to-Server → Generate Access Token, paste the bearer here (~24h). '
+          + 'Or exchange client_credentials from curl/CLI/server and paste the access_token.',
+        { cause: error },
+      );
+    }
     throw error;
   }
 }
 
 /**
  * Ensure we have a valid access token
- * Requests a new token if none exists
- * Does NOT overwrite user-provided tokens
+ * Requests a new token via IMS if none exists and credentials are configured
  */
 async function ensureAccessToken() {
-  // If user manually entered a token, always use that
-  if (userProvidedToken && accessToken) {
-    console.log('Using user-provided token');
-    return accessToken;
-  }
-
+  purgeExpiredIngestionTokenIfNeeded();
   if (!accessToken) {
-    accessToken = await requestAccessToken();
+    const storedIngestion = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+    if (storedIngestion) {
+      accessToken = storedIngestion;
+    } else if (acoRuntime.hasImsClientCredentials) {
+      accessToken = await requestAccessToken();
+    } else {
+      throw new Error(
+        'No access token available. Use Commerce settings: Retrieve bearer token (CLIENT_ID) or paste INGESTION_ACCESS_TOKEN, or open this tool signed in with DA.',
+      );
+    }
+  }
+  return accessToken;
+}
+
+/**
+ * Bearer token for Data Ingestion (POST/PATCH catalog). IMS OAuth must include commerce.aco.ingestion;
+ * the DA SDK user token is not sufficient for writes.
+ * Pasted INGESTION_ACCESS_TOKEN wins (browser IMS client_credentials is often blocked by CORS).
+ */
+async function getBearerForCatalogWrite() {
+  purgeExpiredIngestionTokenIfNeeded();
+  const pastedIngestion = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+  if (pastedIngestion) return pastedIngestion;
+
+  if (acoRuntime.hasImsClientCredentials) {
+    return requestAccessToken();
+  }
+  await ensureAccessToken();
+  if (!accessToken) {
+    throw new Error(
+      'No access token for catalog writes. In Commerce settings use Retrieve bearer token (CLIENT_ID → Fusion) or paste INGESTION_ACCESS_TOKEN.',
+    );
   }
   return accessToken;
 }
@@ -95,7 +380,7 @@ const state = {
   searchTerm: '',
   sortBy: 'featured',
   selectedCategory: 'all',
-  selectedPriceBook: DEFAULT_PRICE_BOOK,
+  selectedPriceBook: getDefaultPriceBook(),
   currentPage: 1,
   totalCount: 0,
   isLoading: false,
@@ -185,8 +470,14 @@ const PRODUCT_SEARCH_QUERY = `
 
 // Fetch products from ACO API
 async function searchProducts(catalogId, locale, priceBook, searchTerm, pageSize, page) {
+  const graphqlUrl = acoRuntime.graphqlUrl;
+  if (!graphqlUrl) {
+    console.warn('ACO GraphQL URL not configured');
+    return { products: [], totalCount: 0 };
+  }
+
   try {
-    const response = await fetch(ACO_URL, {
+    const response = await fetch(graphqlUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -255,9 +546,10 @@ function createIcon(name) {
     loader: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="animate-spin"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>`,
     plus: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>`,
     close: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
-    key: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>`,
     delete: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
     clipboard: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg>`,
+    trash: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>`,
+    settings: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>`,
   };
   const span = document.createElement('span');
   span.className = 'icon';
@@ -272,20 +564,6 @@ const modalState = {
 };
 
 // Modal functions
-function openModal() {
-  const modal = document.getElementById('add-product-modal');
-  if (modal) {
-    modal.classList.add('is-open');
-    document.body.style.overflow = 'hidden';
-    // Reset form
-    const form = modal.querySelector('form');
-    if (form) form.reset();
-    // Focus the first input
-    const firstInput = modal.querySelector('input');
-    if (firstInput) firstInput.focus();
-  }
-}
-
 function closeModal() {
   const modal = document.getElementById('add-product-modal');
   if (modal) {
@@ -300,10 +578,18 @@ function openPasteModal() {
   if (modal) {
     modal.classList.add('is-open');
     document.body.style.overflow = 'hidden';
-    // Reset form
+    const form = modal.querySelector('form');
+    if (form) form.reset();
     const textarea = modal.querySelector('#paste-html');
     if (textarea) textarea.value = '';
-    textarea.focus();
+    const source = modal.querySelector('.plp-paste-modal-source');
+    const toggleBtn = modal.querySelector('#paste-source-toggle');
+    const parseBtn = modal.querySelector('#paste-grid-parse');
+    if (source) source.classList.remove('is-collapsed');
+    if (toggleBtn) toggleBtn.textContent = 'Collapse paste box';
+    if (parseBtn) parseBtn.disabled = false;
+    fillPasteGridTableFromParsed(modal, []);
+    if (textarea) textarea.focus();
   }
 }
 
@@ -311,34 +597,138 @@ function closePasteModal() {
   const modal = document.getElementById('paste-product-modal');
   if (modal) {
     modal.classList.remove('is-open');
-    document.body.style.overflow = '';
+    const jsonOpen = document.getElementById('ingestion-json-preview-modal')?.classList.contains('is-open');
+    document.body.style.overflow = jsonOpen ? 'hidden' : '';
   }
 }
 
-function parseHtmlToProduct(html) {
-  // Create a temporary DOM element to parse the HTML
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(html, 'text/html');
+function normalizePossiblyProtocolRelativeUrl(src) {
+  const s = String(src ?? '').trim();
+  if (!s) return '';
+  if (s.startsWith('//')) return `https:${s}`;
+  return s;
+}
 
-  // Try to extract product data from common patterns
+/**
+ * Walgreens coupon / product list cards (e.g. .item.card.card__product).
+ * Only runs when root is a single card element — not a full Document.
+ */
+function tryParseWalgreensProductCard(root) {
+  if (!root || typeof root.querySelector !== 'function' || root.nodeType !== 1) return null;
+  if (!root.matches?.('.card__product')) return null;
+
   const extracted = {
     sku: '',
     name: '',
     description: '',
-    price: '',
+    price: '0',
+    image: '',
+  };
+
+  const storeLinks = root.querySelectorAll('a[href*="/store/c/"]');
+  for (const link of storeLinks) {
+    const href = link.getAttribute('href') || '';
+    const idMatch = href.match(/\/ID=([^/?#]+)-product/i);
+    if (idMatch) {
+      extracted.sku = idMatch[1].trim();
+      break;
+    }
+  }
+
+  if (!extracted.sku) {
+    const skuInId = /sku(\d{4,})/i;
+    for (const el of root.querySelectorAll('[id]')) {
+      const m = el.id.match(skuInId);
+      if (m) {
+        extracted.sku = m[1];
+        break;
+      }
+    }
+  }
+
+  const titleEl = root.querySelector('.product__title[title]');
+  if (titleEl) {
+    extracted.name = (titleEl.getAttribute('title') || '').trim();
+  }
+  if (!extracted.name) {
+    for (const link of storeLinks) {
+      const sr = link.querySelector(':scope > .sr-only, .sr-only');
+      if (sr) {
+        const t = sr.textContent.replace(/\s+/g, ' ').trim();
+        if (t.length > 3) {
+          extracted.name = t;
+          break;
+        }
+      }
+    }
+  }
+  if (!extracted.name) {
+    const titleLink = root.querySelector('.product__title a[href*="/store/c/"]');
+    if (titleLink) {
+      extracted.name = (titleLink.getAttribute('title') || titleLink.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+  }
+
+  const sizeEl = root.querySelector('[name="wagproductsize"]');
+  if (sizeEl) {
+    extracted.description = sizeEl.textContent.replace(/\s+/g, ' ').trim();
+  }
+
+  const saleBox = root.querySelector('[name="sales-price"], span[id^="sales-price"]');
+  if (saleBox) {
+    const red = saleBox.querySelector('.color__text-red');
+    const txt = (red?.textContent || saleBox.textContent || '').replace(/\s+/g, ' ');
+    const dollarMatches = txt.match(/\$[\d,.]+/g);
+    if (dollarMatches?.length) {
+      const last = dollarMatches[dollarMatches.length - 1];
+      extracted.price = last.replace(/[^\d.]/g, '') || '0';
+    }
+  }
+
+  let imgSrc = '';
+  const figImg = root.querySelector('figure.product__img img[src]');
+  if (figImg) imgSrc = figImg.getAttribute('src') || '';
+  if (!imgSrc) {
+    const w = root.querySelector('img[src*="pics.walgreens.com"]');
+    if (w) imgSrc = w.getAttribute('src') || '';
+  }
+  if (!imgSrc) {
+    const any = root.querySelector('img[src]');
+    if (any) imgSrc = any.getAttribute('src') || '';
+  }
+  extracted.image = normalizePossiblyProtocolRelativeUrl(imgSrc);
+
+  if (extracted.name) {
+    extracted.name = extracted.name.replace(/\s+/g, ' ').trim();
+  }
+
+  if (!extracted.sku || !extracted.name) return null;
+  extracted.brand = guessBrandFromProductName(extracted.name);
+  return extracted;
+}
+
+function parseDomToProduct(root) {
+  const wag = tryParseWalgreensProductCard(root);
+  if (wag) return wag;
+
+  const extracted = {
+    sku: '',
+    name: '',
+    description: '',
+    price: '0',
     image: '',
   };
 
   // ===== EXTRACT SKU =====
   // Try data attributes first
-  const skuEl = doc.querySelector('[data-sku], [data-product-sku], [data-product-id], [data-item-id]');
+  const skuEl = root.querySelector('[data-sku], [data-product-sku], [data-product-id], [data-item-id]');
   if (skuEl) {
     extracted.sku = skuEl.dataset.sku || skuEl.dataset.productSku || skuEl.dataset.productId || skuEl.dataset.itemId;
   }
 
   // Try to extract SKU/ID from URLs (common pattern like /product/12345 or /p/name/12345)
   if (!extracted.sku) {
-    const links = doc.querySelectorAll('a[href]');
+    const links = root.querySelectorAll('a[href]');
     for (const link of links) {
       const href = link.getAttribute('href') || '';
       // Match patterns like /p/product-name/0001111097872 or /product/12345
@@ -352,7 +742,7 @@ function parseHtmlToProduct(html) {
 
   // Try extracting from image URLs
   if (!extracted.sku) {
-    const img = doc.querySelector('img[src]');
+    const img = root.querySelector('img[src]');
     if (img) {
       const src = img.getAttribute('src') || '';
       const skuMatch = src.match(/\/(\d{10,})/);
@@ -364,7 +754,7 @@ function parseHtmlToProduct(html) {
 
   // Fallback to class-based selectors
   if (!extracted.sku) {
-    const skuTextEl = doc.querySelector('.sku, .product-sku, #sku, [class*="sku"]');
+    const skuTextEl = root.querySelector('.sku, .product-sku, #sku, [class*="sku"]');
     if (skuTextEl) {
       extracted.sku = skuTextEl.textContent.trim();
     }
@@ -372,7 +762,7 @@ function parseHtmlToProduct(html) {
 
   // ===== EXTRACT NAME =====
   // Try aria-label on main container (common in modern e-commerce)
-  const containerWithLabel = doc.querySelector('[aria-label]');
+  const containerWithLabel = root.querySelector('[aria-label]');
   if (containerWithLabel) {
     const label = containerWithLabel.getAttribute('aria-label');
     // Check if it looks like a product name (not a generic label)
@@ -383,7 +773,7 @@ function parseHtmlToProduct(html) {
 
   // Try data-testid patterns (common in React apps)
   if (!extracted.name) {
-    const testIdEl = doc.querySelector('[data-testid="product-title"], [data-testid="product-name"], [data-testid="cart-page-item-description"], [data-testid*="description"], [data-testid*="title"]');
+    const testIdEl = root.querySelector('[data-testid="product-title"], [data-testid="product-name"], [data-testid="cart-page-item-description"], [data-testid*="description"], [data-testid*="title"]');
     if (testIdEl) {
       extracted.name = testIdEl.textContent.trim();
     }
@@ -391,7 +781,7 @@ function parseHtmlToProduct(html) {
 
   // Try heading elements and common classes
   if (!extracted.name) {
-    const nameEl = doc.querySelector('h1, h2, h3, .product-name, .product-title, [data-product-name], .title, .name');
+    const nameEl = root.querySelector('h1, h2, h3, .product-name, .product-title, [data-product-name], .title, .name');
     if (nameEl) {
       extracted.name = nameEl.dataset.productName || nameEl.textContent.trim();
     }
@@ -399,14 +789,14 @@ function parseHtmlToProduct(html) {
 
   // ===== EXTRACT DESCRIPTION =====
   // Try data-testid for sizing/details
-  const sizingEl = doc.querySelector('[data-testid="product-item-sizing"], [data-testid*="sizing"], [data-testid*="size"]');
+  const sizingEl = root.querySelector('[data-testid="product-item-sizing"], [data-testid*="sizing"], [data-testid*="size"]');
   if (sizingEl) {
     extracted.description = sizingEl.textContent.trim();
   }
 
   // Try common description selectors
   if (!extracted.description) {
-    const descEl = doc.querySelector('.description, .product-description, [data-description], p.desc, .details, [class*="description"]');
+    const descEl = root.querySelector('.description, .product-description, [data-description], p.desc, .details, [class*="description"]');
     if (descEl) {
       extracted.description = descEl.dataset.description || descEl.textContent.trim();
     }
@@ -419,7 +809,7 @@ function parseHtmlToProduct(html) {
 
   // ===== EXTRACT PRICE =====
   // Try <data> element with value attribute (semantic price markup)
-  const dataEl = doc.querySelector('data[value], data[typeof="Price"]');
+  const dataEl = root.querySelector('data[value], data[typeof="Price"]');
   if (dataEl) {
     const value = dataEl.getAttribute('value');
     if (value) {
@@ -429,7 +819,7 @@ function parseHtmlToProduct(html) {
 
   // Try data-testid for price
   if (!extracted.price) {
-    const priceTestId = doc.querySelector('[data-testid*="price"], [data-testid*="cost"]');
+    const priceTestId = root.querySelector('[data-testid*="price"], [data-testid*="cost"]');
     if (priceTestId) {
       const priceText = priceTestId.textContent.trim();
       const priceMatch = priceText.match(/\$?([\d,.]+)/);
@@ -441,7 +831,7 @@ function parseHtmlToProduct(html) {
 
   // Try common price classes
   if (!extracted.price) {
-    const priceEl = doc.querySelector('.price, .product-price, [data-price], .cost, .amount, [class*="Price"], [class*="price"]');
+    const priceEl = root.querySelector('.price, .product-price, [data-price], .cost, .amount, [class*="Price"], [class*="price"]');
     if (priceEl) {
       const priceText = priceEl.dataset.price || priceEl.getAttribute('value') || priceEl.textContent.trim();
       const priceMatch = priceText.match(/\$?([\d,.]+)/);
@@ -453,14 +843,14 @@ function parseHtmlToProduct(html) {
 
   // ===== EXTRACT IMAGE =====
   // Try product image with data-testid
-  const productImg = doc.querySelector('[data-testid="product-image"] img, [data-testid="product-image-loaded"], .product-image img');
+  const productImg = root.querySelector('[data-testid="product-image"] img, [data-testid="product-image-loaded"], .product-image img');
   if (productImg) {
     extracted.image = productImg.getAttribute('src') || productImg.dataset.src || '';
   }
 
   // Try any image
   if (!extracted.image) {
-    const imgEl = doc.querySelector('img[src]');
+    const imgEl = root.querySelector('img[src]');
     if (imgEl) {
       extracted.image = imgEl.getAttribute('src') || imgEl.dataset.src || imgEl.dataset.image || '';
     }
@@ -472,9 +862,333 @@ function parseHtmlToProduct(html) {
     extracted.name = extracted.name.replace(/\s+/g, ' ').trim();
   }
 
-  console.log('Parsed HTML - extracted data:', extracted);
+  const brandEl = root.querySelector(
+    '[data-brand], [itemprop="brand"], .product-brand, .pdp-brand, [class*="ProductBrand"]',
+  );
+  let brand = '';
+  if (brandEl) {
+    brand = (
+      brandEl.getAttribute('content')
+      || brandEl.getAttribute('data-brand')
+      || brandEl.textContent
+      || ''
+    )
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  if (!brand) brand = guessBrandFromProductName(extracted.name);
+  extracted.brand = brand;
 
   return extracted;
+}
+
+function normalizeFeedProductRowFromJson(item, idx) {
+  const meta = item.metaTags || {};
+  const kw = meta.keywords;
+  const metaKeywords = Array.isArray(kw)
+    ? kw.join(', ')
+    : kw != null && kw !== ''
+      ? String(kw)
+      : '';
+  const img0 = Array.isArray(item.images) && item.images.length ? item.images[0] : null;
+  const vis = item.visibleIn;
+  const visibleIn = Array.isArray(vis)
+    ? vis.join(',')
+    : typeof vis === 'string'
+      ? vis
+      : '';
+
+  const price =
+    item.price !== undefined && item.price !== null && item.price !== ''
+      ? String(item.price).replace(/[^\d.]/g, '') || '0'
+      : '0';
+
+  const locale =
+    item.source && typeof item.source === 'object' && item.source.locale != null
+      ? String(item.source.locale).trim()
+      : String(item.locale ?? '').trim();
+
+  const attrs = item.attributes;
+  const attributesJson =
+    Array.isArray(attrs) && attrs.length > 0 ? JSON.stringify(attrs) : '';
+
+  const lnks = item.links;
+  const linksJson = Array.isArray(lnks) && lnks.length > 0 ? JSON.stringify(lnks) : '';
+
+  const rts = item.routes;
+  const routesJson = Array.isArray(rts) && rts.length > 0 ? JSON.stringify(rts) : '';
+
+  return {
+    sku: String(item.sku ?? '').trim(),
+    locale: locale || DEFAULT_LOCALE,
+    name: String(item.name ?? '').trim(),
+    slug: String(item.slug ?? '').trim(),
+    status: String(item.status ?? 'ENABLED').trim(),
+    shortDescription: String(item.shortDescription ?? '').trim(),
+    description: String(item.description ?? '').trim(),
+    visibleIn: visibleIn || 'CATALOG,SEARCH',
+    metaTitle: String(meta.title ?? '').trim(),
+    metaDescription: String(meta.description ?? '').trim(),
+    metaKeywords,
+    imageUrl: String(img0?.url ?? item.imageUrl ?? item.image ?? '').trim(),
+    imageLabel: String(img0?.label ?? '').trim(),
+    imageRoles: Array.isArray(img0?.roles)
+      ? img0.roles.join(',')
+      : String(img0?.roles ?? '').trim(),
+    attributesJson,
+    linksJson,
+    routesJson,
+    price,
+    priceBookId: String(item.priceBookId ?? '').trim(),
+    _row: idx + 1,
+  };
+}
+
+function normalizeSparsePasteRow(product, index) {
+  const merged = {
+    locale: DEFAULT_LOCALE,
+    status: 'ENABLED',
+    visibleIn: 'CATALOG,SEARCH',
+    imageRoles: 'THUMBNAIL,BASE,SMALL',
+    shortDescription: '',
+    description: '',
+    slug: '',
+    metaTitle: '',
+    metaDescription: '',
+    metaKeywords: '',
+    imageUrl: '',
+    imageLabel: '',
+    attributesJson: '',
+    linksJson: '',
+    routesJson: '',
+    price: '0',
+    priceBookId: '',
+    ...product,
+  };
+
+  if (merged.image && !merged.imageUrl) merged.imageUrl = String(merged.image).trim();
+
+  const sku =
+    merged.sku?.trim() ||
+    (merged.name?.trim() ? `GRID-${Date.now()}-${index + 1}` : '');
+  merged.sku = sku;
+  merged.price =
+    merged.price !== undefined && merged.price !== null && merged.price !== ''
+      ? String(merged.price).replace(/[^\d.]/g, '') || '0'
+      : '0';
+
+  if (!String(merged.attributesJson ?? '').trim()) {
+    const brandVal =
+      String(merged.brand ?? '').trim()
+      || guessBrandFromProductName(merged.name)
+      || PASTE_GRID_DEFAULT_BRAND;
+    merged.attributesJson = defaultBrandAttributesJson(brandVal);
+  }
+  delete merged.brand;
+
+  return merged;
+}
+
+function parseProductGridInput(rawInput) {
+  const input = rawInput.trim();
+  if (!input) return [];
+
+  try {
+    const parsed = JSON.parse(input);
+    const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.products) ? parsed.products : [];
+    if (list.length > 0) {
+      return list.map((item, idx) => normalizeFeedProductRowFromJson(item, idx)).filter((r) => r.sku && r.name);
+    }
+  } catch (e) {
+    // not JSON; continue with HTML parsing
+  }
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(input, 'text/html');
+
+  const selectorGroups = [
+    '.item.card.card__product, .card__product',
+    '[data-sku], [data-product-sku], [data-product-id], [data-item-id]',
+    '.product-card, .product-item, .product-tile, .product',
+    'article.product, article[data-product-id], li.product, li.product-item',
+  ];
+
+  let selectedNodes = [];
+  selectorGroups.forEach((selector) => {
+    const nodes = Array.from(doc.querySelectorAll(selector));
+    if (nodes.length > selectedNodes.length) selectedNodes = nodes;
+  });
+
+  if (selectedNodes.length <= 1) {
+    selectedNodes = Array.from(doc.querySelectorAll('table tbody tr, table tr')).filter((tr) => tr.querySelectorAll('td').length >= 2);
+  }
+
+  let products = [];
+
+  if (selectedNodes.length > 0) {
+    products = selectedNodes.map((node, idx) => {
+      if (node.matches('tr')) {
+        const cells = Array.from(node.querySelectorAll('td')).map((td) => td.textContent.trim());
+        const sku = (cells.find((v) => /^[A-Z0-9._-]{4,}$/i.test(v)) || '').trim();
+        const priceRaw = (cells.find((v) => /\$?\s*\d+([.,]\d{1,2})?/.test(v)) || '0').replace(/[^\d.]/g, '') || '0';
+        const nameCandidate = (cells.find((v) => v && v !== sku && !/\$?\s*\d+([.,]\d{1,2})?/.test(v)) || '').trim();
+        return {
+          sku,
+          name: nameCandidate,
+          description: '',
+          price: priceRaw,
+          imageUrl: '',
+          brand: guessBrandFromProductName(nameCandidate),
+          _row: idx + 1,
+        };
+      }
+      const dom = parseDomToProduct(node);
+      return {
+        sku: dom.sku,
+        name: dom.name,
+        description: dom.description,
+        price: dom.price,
+        imageUrl: dom.image,
+        brand: dom.brand || '',
+        _row: idx + 1,
+      };
+    });
+  } else {
+    const dom = parseDomToProduct(doc);
+    products = [
+      {
+        sku: dom.sku,
+        name: dom.name,
+        description: dom.description,
+        price: dom.price,
+        imageUrl: dom.image,
+        brand: dom.brand || '',
+        _row: 1,
+      },
+    ];
+  }
+
+  return products.map((product, index) => normalizeSparsePasteRow(product, index)).filter((r) => r.sku && r.name);
+}
+
+function clearPasteGridTable(modal) {
+  const tbody = modal.querySelector('#paste-grid-tbody');
+  if (tbody) tbody.innerHTML = '';
+}
+
+function appendPasteGridRow(modal, product = {}) {
+  const tbody = modal.querySelector('#paste-grid-tbody');
+  if (!tbody) return;
+
+  const defaults = {
+    locale: DEFAULT_LOCALE,
+    status: 'ENABLED',
+    visibleIn: 'CATALOG,SEARCH',
+    imageRoles: 'THUMBNAIL,BASE,SMALL',
+    shortDescription: '',
+    description: '',
+    slug: '',
+    metaTitle: '',
+    metaDescription: '',
+    metaKeywords: '',
+    imageUrl: '',
+    imageLabel: '',
+    attributesJson: '',
+    linksJson: '',
+    routesJson: '',
+    price: '',
+    priceBookId: '',
+  };
+  const p = { ...defaults, ...product };
+  if (p.image && !p.imageUrl) p.imageUrl = String(p.image).trim();
+
+  const tr = document.createElement('tr');
+  tr.className = 'plp-paste-grid-row';
+
+  PASTE_GRID_COLUMNS.forEach((col) => {
+    const td = document.createElement('td');
+    let el;
+    if (col.textarea) {
+      el = document.createElement('textarea');
+      el.rows = col.rows || 2;
+      el.className = 'plp-form-input plp-paste-grid-input plp-paste-grid-textarea';
+    } else {
+      el = document.createElement('input');
+      el.type = col.inputType || 'text';
+      el.className = 'plp-form-input plp-paste-grid-input';
+    }
+    el.dataset.gridField = col.field;
+    el.value = p[col.field] != null ? String(p[col.field]) : '';
+    if (col.field === 'priceBookId') {
+      el.placeholder = getDefaultPriceBook();
+    } else if (col.placeholder) {
+      el.placeholder = col.placeholder;
+    }
+    td.appendChild(el);
+    tr.appendChild(td);
+  });
+
+  const actionsTd = document.createElement('td');
+  actionsTd.className = 'plp-paste-grid-actions-cell';
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'plp-button plp-button-secondary plp-paste-grid-remove';
+  removeBtn.textContent = 'Remove';
+  removeBtn.addEventListener('click', () => {
+    tr.remove();
+    const tbodyNow = modal.querySelector('#paste-grid-tbody');
+    if (tbodyNow && !tbodyNow.querySelector('tr')) {
+      appendPasteGridRow(modal, {});
+    }
+  });
+  actionsTd.appendChild(removeBtn);
+  tr.appendChild(actionsTd);
+
+  tbody.appendChild(tr);
+}
+
+function fillPasteGridTableFromParsed(modal, products) {
+  clearPasteGridTable(modal);
+  if (!products.length) {
+    appendPasteGridRow(modal, {});
+    return;
+  }
+  products.forEach((p) => appendPasteGridRow(modal, p));
+}
+
+function getProductsFromPasteGridModal(modal) {
+  const rows = modal.querySelectorAll('#paste-grid-tbody tr');
+  const out = [];
+  rows.forEach((tr) => {
+    const row = {};
+    PASTE_GRID_COLUMNS.forEach((col) => {
+      const el = tr.querySelector(`[data-grid-field="${col.field}"]`);
+      row[col.field] = el ? el.value.trim() : '';
+    });
+    if (!row.sku && !row.name) return;
+    const skuFinal = row.sku || (row.name ? `GRID-${Date.now()}-${out.length + 1}` : '');
+    if (!skuFinal || !row.name) return;
+    row.sku = skuFinal;
+    out.push(row);
+  });
+  return out;
+}
+
+function togglePasteSourceSection() {
+  const modal = document.getElementById('paste-product-modal');
+  if (!modal) return;
+
+  const source = modal.querySelector('.plp-paste-modal-source');
+  const toggleBtn = modal.querySelector('#paste-source-toggle');
+  const parseBtn = modal.querySelector('#paste-grid-parse');
+  const textarea = modal.querySelector('#paste-html');
+  if (!source || !toggleBtn) return;
+
+  const willCollapse = !source.classList.contains('is-collapsed');
+  source.classList.toggle('is-collapsed', willCollapse);
+  toggleBtn.textContent = willCollapse ? 'Expand paste box' : 'Collapse paste box';
+  if (parseBtn) parseBtn.disabled = willCollapse;
+  if (!willCollapse && textarea) textarea.focus();
 }
 
 function handleParseHtml() {
@@ -483,75 +1197,481 @@ function handleParseHtml() {
   const html = textarea.value.trim();
 
   if (!html) {
-    alert('Please paste some HTML first');
+    alert('Paste JSON or HTML first.');
     return;
   }
 
-  const extracted = parseHtmlToProduct(html);
-
-  // Populate the form fields
-  const skuInput = modal.querySelector('#paste-sku');
-  const nameInput = modal.querySelector('#paste-name');
-  const descInput = modal.querySelector('#paste-description');
-  const priceInput = modal.querySelector('#paste-price');
-  const imageInput = modal.querySelector('#paste-image');
-
-  if (skuInput) skuInput.value = extracted.sku;
-  if (nameInput) nameInput.value = extracted.name;
-  if (descInput) descInput.value = extracted.description;
-  if (priceInput) priceInput.value = extracted.price;
-  if (imageInput) imageInput.value = extracted.image;
-
-  console.log('Parsed product data:', extracted);
+  const parsedProducts = parseProductGridInput(html);
+  if (!parsedProducts.length) {
+    alert('No products detected. Check your paste format or add rows manually.');
+    return;
+  }
+  fillPasteGridTableFromParsed(modal, parsedProducts);
+  console.log('Parsed product grid → table:', parsedProducts);
 }
 
-async function handlePasteSubmit(form) {
+const PASTE_GRID_DEFAULT_VISIBLE = ['CATALOG', 'SEARCH'];
+
+function parsePasteGridJsonArray(raw, label) {
+  const s = String(raw ?? '').trim();
+  if (!s) return [];
+  let v;
+  try {
+    v = JSON.parse(s);
+  } catch (e) {
+    throw new Error(`${label}: invalid JSON (${e.message})`);
+  }
+  if (!Array.isArray(v)) throw new Error(`${label}: expected a JSON array`);
+  return v;
+}
+
+function visibleInFromPasteCell(raw) {
+  return String(raw ?? '')
+    .split(',')
+    .map((x) => x.trim().toUpperCase())
+    .filter(Boolean);
+}
+
+/**
+ * Build product + price payloads for one paste grid row (same shape as API / ingestion samples).
+ * @throws {Error} on invalid JSON in Attributes / Links / Routes columns
+ */
+function buildPayloadsFromPasteGridRow(product) {
+  let attributes = parsePasteGridJsonArray(product.attributesJson, `SKU ${product.sku}: Attributes JSON`);
+  if (!attributes.length) {
+    attributes = defaultBrandAttributesArray(PASTE_GRID_DEFAULT_BRAND);
+  }
+  const links = parsePasteGridJsonArray(product.linksJson, `SKU ${product.sku}: Links JSON`);
+  const routes = parsePasteGridJsonArray(product.routesJson, `SKU ${product.sku}: Routes JSON`);
+
+  const vis = visibleInFromPasteCell(product.visibleIn);
+  const visibleInFinal = vis.length ? vis : PASTE_GRID_DEFAULT_VISIBLE;
+
+  const images = [];
+  if (product.imageUrl?.trim()) {
+    images.push({
+      url: product.imageUrl.trim(),
+      label: (product.imageLabel || product.name || '').trim(),
+      roles: (product.imageRoles || 'THUMBNAIL, BASE, SMALL').trim(),
+    });
+  }
+
+  const productPayload = buildProductPayload({
+    sku: product.sku,
+    name: product.name,
+    slug: product.slug,
+    status: product.status,
+    locale: product.locale,
+    description: product.description || '',
+    shortDescription: product.shortDescription || '',
+    visibleIn: visibleInFinal,
+    metaTitle: product.metaTitle,
+    metaDescription: product.metaDescription,
+    metaKeywords: product.metaKeywords,
+    attributes,
+    links,
+    routes,
+    images,
+  });
+  // Price ingestion always uses PRICE_BOOK_ID from Commerce settings (not per-row grid cells).
+  const priceBookId = getDefaultPriceBook();
+  const pricePayload = buildPricePayload(product.sku, product.price || '0', priceBookId);
+  return { productPayload, pricePayload };
+}
+
+/**
+ * Current ingestion-shaped arrays from the paste grid (mirrors data/products.json + data/prices.json).
+ * Rows with invalid JSON are omitted and listed in errors.
+ */
+function buildIngestionPreviewFromPasteGrid() {
+  const pasteModalEl = document.getElementById('paste-product-modal');
+  const gridProducts = pasteModalEl ? getProductsFromPasteGridModal(pasteModalEl) : [];
+  const products = [];
+  const prices = [];
+  const errors = [];
+
+  gridProducts.forEach((product) => {
+    try {
+      const { productPayload, pricePayload } = buildPayloadsFromPasteGridRow(product);
+      products.push(productPayload);
+      prices.push(pricePayload);
+    } catch (e) {
+      errors.push(`${product.sku}: ${e.message || String(e)}`);
+    }
+  });
+
+  return { products, prices, errors };
+}
+
+function closeIngestionJsonPreviewModal() {
+  const modal = document.getElementById('ingestion-json-preview-modal');
+  if (!modal) return;
+  modal.classList.remove('is-open');
+  const pasteOpen = document.getElementById('paste-product-modal')?.classList.contains('is-open');
+  document.body.style.overflow = pasteOpen ? 'hidden' : '';
+}
+
+function isAnyProductToolModalOpen() {
+  return Boolean(
+    document.getElementById('paste-product-modal')?.classList.contains('is-open')
+      || document.getElementById('add-product-modal')?.classList.contains('is-open')
+      || document.getElementById('aco-settings-modal')?.classList.contains('is-open')
+      || document.getElementById('edit-product-modal')?.classList.contains('is-open')
+      || document.getElementById('delete-by-sku-modal')?.classList.contains('is-open')
+      || document.getElementById('ingestion-json-preview-modal')?.classList.contains('is-open')
+      || document.getElementById('api-response-modal')?.classList.contains('is-open'),
+  );
+}
+
+function closeApiResponseModal() {
+  const modal = document.getElementById('api-response-modal');
+  if (!modal) return;
+  modal.classList.remove('is-open');
+  document.body.style.overflow = isAnyProductToolModalOpen() ? 'hidden' : '';
+}
+
+/**
+ * @param {{ title: string, subtitle?: string, bodyText: string }} opts
+ */
+function openApiResponseModal(opts) {
+  const modal = document.getElementById('api-response-modal');
+  if (!modal) return;
+  const titleEl = modal.querySelector('#api-response-modal-title');
+  const subEl = modal.querySelector('#api-response-modal-subtitle');
+  const pre = modal.querySelector('#api-response-modal-pre');
+  if (titleEl) titleEl.textContent = opts.title || 'API response';
+  if (subEl) {
+    const sub = opts.subtitle ?? '';
+    subEl.textContent = sub;
+    subEl.hidden = !sub;
+  }
+  if (pre) pre.textContent = opts.bodyText ?? '';
+  modal.classList.add('is-open');
+  document.body.style.overflow = 'hidden';
+}
+
+async function copyApiResponseModal() {
+  const pre = document.getElementById('api-response-modal')?.querySelector('#api-response-modal-pre');
+  const btn = document.getElementById('api-response-modal-copy');
+  if (!pre) return;
+  try {
+    await navigator.clipboard.writeText(pre.textContent);
+    if (btn) {
+      const prev = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(() => {
+        btn.textContent = prev;
+      }, 1800);
+    }
+  } catch (e) {
+    console.warn('Clipboard failed:', e);
+    alert('Could not copy to clipboard.');
+  }
+}
+
+function createApiResponseModal() {
+  const modal = document.createElement('div');
+  modal.id = 'api-response-modal';
+  modal.className = 'plp-modal plp-modal-json-preview';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'plp-modal-overlay';
+  overlay.addEventListener('click', closeApiResponseModal);
+
+  const dialog = document.createElement('div');
+  dialog.className = 'plp-modal-dialog plp-modal-dialog-xlarge plp-modal-dialog-json-preview';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-labelledby', 'api-response-modal-title');
+
+  const header = document.createElement('div');
+  header.className = 'plp-modal-header';
+
+  const title = document.createElement('h2');
+  title.id = 'api-response-modal-title';
+  title.className = 'plp-modal-title';
+  title.textContent = 'API response';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.className = 'plp-modal-close';
+  closeBtn.setAttribute('aria-label', 'Close modal');
+  closeBtn.appendChild(createIcon('close'));
+  closeBtn.addEventListener('click', closeApiResponseModal);
+
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+
+  const body = document.createElement('div');
+  body.className = 'plp-modal-body plp-json-preview-body';
+
+  const subtitle = document.createElement('p');
+  subtitle.id = 'api-response-modal-subtitle';
+  subtitle.className = 'plp-form-help plp-json-preview-hint';
+  subtitle.hidden = true;
+
+  const pre = document.createElement('pre');
+  pre.id = 'api-response-modal-pre';
+  pre.className = 'plp-json-preview-pre';
+  pre.setAttribute('tabindex', '0');
+
+  body.appendChild(subtitle);
+  body.appendChild(pre);
+
+  const footer = document.createElement('div');
+  footer.className = 'plp-modal-footer plp-json-preview-footer';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.id = 'api-response-modal-copy';
+  copyBtn.className = 'plp-button plp-button-secondary';
+  copyBtn.textContent = 'Copy';
+  copyBtn.addEventListener('click', () => copyApiResponseModal());
+
+  const closeFooterBtn = document.createElement('button');
+  closeFooterBtn.type = 'button';
+  closeFooterBtn.className = 'plp-button';
+  closeFooterBtn.textContent = 'Close';
+  closeFooterBtn.addEventListener('click', closeApiResponseModal);
+
+  footer.appendChild(copyBtn);
+  footer.appendChild(closeFooterBtn);
+
+  dialog.appendChild(header);
+  dialog.appendChild(body);
+  dialog.appendChild(footer);
+
+  modal.appendChild(overlay);
+  modal.appendChild(dialog);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal.classList.contains('is-open')) {
+      closeApiResponseModal();
+    }
+  });
+
+  return modal;
+}
+
+function openIngestionJsonPreview(kind) {
+  const modal = document.getElementById('ingestion-json-preview-modal');
+  if (!modal) return;
+
+  const { products, prices, errors } = buildIngestionPreviewFromPasteGrid();
+  const titleEl = modal.querySelector('#ingestion-json-preview-title');
+  const hintEl = modal.querySelector('#ingestion-json-preview-hint');
+  const errEl = modal.querySelector('#ingestion-json-preview-errors');
+  const pre = modal.querySelector('#ingestion-json-preview-pre');
+
+  const isProducts = kind === 'products';
+  if (titleEl) {
+    titleEl.textContent = isProducts ? 'data/products.json (current)' : 'data/prices.json (current)';
+  }
+  const arr = isProducts ? products : prices;
+  if (pre) pre.textContent = JSON.stringify(arr, null, 2);
+
+  if (hintEl) {
+    hintEl.textContent =
+      products.length === 0 && errors.length === 0
+        ? 'No rows with both SKU and name in the Paste Product Grid. Open that flow, parse or edit the table, then view again.'
+        : `Reflects ${products.length} row(s) from the grid as JSON would be sent (ingestion-style arrays).`;
+  }
+
+  if (errEl) {
+    if (errors.length) {
+      errEl.hidden = false;
+      errEl.textContent = `Skipped ${errors.length} row(s) (fix JSON columns):\n${errors.join('\n')}`;
+    } else {
+      errEl.hidden = true;
+      errEl.textContent = '';
+    }
+  }
+
+  modal.classList.add('is-open');
+  document.body.style.overflow = 'hidden';
+}
+
+async function copyIngestionJsonPreview() {
+  const pre = document.getElementById('ingestion-json-preview-pre');
+  const btn = document.getElementById('ingestion-json-preview-copy');
+  if (!pre) return;
+  try {
+    await navigator.clipboard.writeText(pre.textContent);
+    if (btn) {
+      const prev = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(() => {
+        btn.textContent = prev;
+      }, 1800);
+    }
+  } catch (e) {
+    console.warn('Clipboard failed:', e);
+    alert('Could not copy to clipboard.');
+  }
+}
+
+function createIngestionJsonPreviewModal() {
+  const modal = document.createElement('div');
+  modal.id = 'ingestion-json-preview-modal';
+  modal.className = 'plp-modal plp-modal-json-preview';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'plp-modal-overlay';
+  overlay.addEventListener('click', closeIngestionJsonPreviewModal);
+
+  const dialog = document.createElement('div');
+  dialog.className = 'plp-modal-dialog plp-modal-dialog-xlarge plp-modal-dialog-json-preview';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-labelledby', 'ingestion-json-preview-title');
+
+  const header = document.createElement('div');
+  header.className = 'plp-modal-header';
+
+  const title = document.createElement('h2');
+  title.id = 'ingestion-json-preview-title';
+  title.className = 'plp-modal-title';
+  title.textContent = 'JSON preview';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'plp-modal-close';
+  closeBtn.setAttribute('aria-label', 'Close modal');
+  closeBtn.appendChild(createIcon('close'));
+  closeBtn.addEventListener('click', closeIngestionJsonPreviewModal);
+
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+
+  const body = document.createElement('div');
+  body.className = 'plp-modal-body plp-json-preview-body';
+
+  const hint = document.createElement('p');
+  hint.id = 'ingestion-json-preview-hint';
+  hint.className = 'plp-form-help plp-json-preview-hint';
+
+  const errBox = document.createElement('pre');
+  errBox.id = 'ingestion-json-preview-errors';
+  errBox.className = 'plp-json-preview-errors';
+  errBox.hidden = true;
+
+  const pre = document.createElement('pre');
+  pre.id = 'ingestion-json-preview-pre';
+  pre.className = 'plp-json-preview-pre';
+  pre.setAttribute('tabindex', '0');
+
+  body.appendChild(hint);
+  body.appendChild(errBox);
+  body.appendChild(pre);
+
+  const footer = document.createElement('div');
+  footer.className = 'plp-modal-footer plp-json-preview-footer';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.id = 'ingestion-json-preview-copy';
+  copyBtn.className = 'plp-button plp-button-secondary';
+  copyBtn.textContent = 'Copy JSON';
+
+  const closeFooterBtn = document.createElement('button');
+  closeFooterBtn.type = 'button';
+  closeFooterBtn.className = 'plp-button';
+  closeFooterBtn.textContent = 'Close';
+  closeFooterBtn.addEventListener('click', closeIngestionJsonPreviewModal);
+
+  copyBtn.addEventListener('click', () => copyIngestionJsonPreview());
+
+  footer.appendChild(copyBtn);
+  footer.appendChild(closeFooterBtn);
+
+  dialog.appendChild(header);
+  dialog.appendChild(body);
+  dialog.appendChild(footer);
+
+  modal.appendChild(overlay);
+  modal.appendChild(dialog);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal.classList.contains('is-open')) {
+      closeIngestionJsonPreviewModal();
+    }
+  });
+
+  return modal;
+}
+
+/**
+ * POST the paste grid’s price payloads in one request (same JSON as “View prices.json”).
+ */
+async function handlePasteModalSubmitPricesFromGrid() {
   if (modalState.isSubmitting) return;
 
-  // Get visibility checkboxes
-  const visibilityCheckboxes = form.querySelectorAll('input[name="paste-visible-in"]:checked');
-  const visibleIn = Array.from(visibilityCheckboxes).map((cb) => cb.value);
+  const { prices, errors } = buildIngestionPreviewFromPasteGrid();
 
-  const formData = {
-    sku: form.querySelector('#paste-sku')?.value.trim() || '',
-    name: form.querySelector('#paste-name')?.value.trim() || '',
-    description: form.querySelector('#paste-description')?.value.trim() || '',
-    price: form.querySelector('#paste-price')?.value || '0',
-    imageUrl: form.querySelector('#paste-image')?.value.trim() || '',
-    visibleIn,
-    // Attributes
-    attributes: extractDynamicListItems(form, 'paste-product-attributes', ['code', 'type', 'value']),
-    // Meta tags
-    metaTitle: form.querySelector('#paste-meta-title')?.value.trim() || '',
-    metaDescription: form.querySelector('#paste-meta-description')?.value.trim() || '',
-    metaKeywords: form.querySelector('#paste-meta-keywords')?.value.trim() || '',
-  };
-
-  if (!formData.sku || !formData.name) {
-    alert('SKU and Product Name are required');
+  if (!prices.length) {
+    alert(
+      errors.length
+        ? `No price rows to submit. Fix:\n${errors.join('\n')}`
+        : 'Fill the grid (SKU + name) so prices can be built, or use Parse Grid first.',
+    );
     return;
   }
 
-  console.log('Submitting pasted product:', formData);
+  if (errors.length) {
+    const proceed = window.confirm(
+      `${errors.length} row(s) were skipped (invalid JSON in columns, etc.). Submit ${prices.length} price row(s) anyway?`,
+    );
+    if (!proceed) return;
+  }
 
-  // Build payloads
-  const productPayload = buildProductPayload({
-    ...formData,
-    shortDescription: formData.description,
-    images: formData.imageUrl ? [{ url: formData.imageUrl, label: formData.name, roles: 'THUMBNAIL, BASE, SMALL' }] : [],
-    attributes: formData.attributes,
-    metaTitle: formData.metaTitle,
-    metaDescription: formData.metaDescription,
-    metaKeywords: formData.metaKeywords,
-  });
-  const pricePayload = buildPricePayload(formData.sku, formData.price, DEFAULT_PRICE_BOOK);
+  const pasteModal = document.getElementById('paste-product-modal');
+  const submitPricesBtn = pasteModal?.querySelector('.plp-paste-submit-prices-btn');
 
-  console.log('Product Payload:', JSON.stringify(productPayload, null, 2));
-  console.log('Price Payload:', JSON.stringify(pricePayload, null, 2));
+  try {
+    modalState.isSubmitting = true;
+    if (submitPricesBtn) {
+      submitPricesBtn.disabled = true;
+      submitPricesBtn.textContent = 'Submitting prices…';
+    }
+
+    const result = await submitPricesBatchToACO(prices);
+    const errNote = errors.length ? ` · ${errors.length} grid row(s) skipped` : '';
+    openApiResponseModal({
+      title: 'Submit prices — API response',
+      subtitle: `Success · ${prices.length} row(s)${errNote}`,
+      bodyText: JSON.stringify(result, null, 2),
+    });
+  } catch (error) {
+    const detail =
+      `${error?.message || String(error)}${error?.cause ? `\n\ncause: ${error.cause}` : ''}`;
+    openApiResponseModal({
+      title: 'Submit prices — API error',
+      subtitle: `${prices.length} row(s) in body`,
+      bodyText: detail,
+    });
+  } finally {
+    modalState.isSubmitting = false;
+    if (submitPricesBtn) {
+      submitPricesBtn.disabled = false;
+      submitPricesBtn.textContent = 'Submit prices';
+    }
+  }
+}
+
+async function handlePasteSubmit() {
+  if (modalState.isSubmitting) return;
+
+  const pasteModalEl = document.getElementById('paste-product-modal');
+  const form = pasteModalEl?.querySelector('form');
+  const gridProducts = getProductsFromPasteGridModal(pasteModalEl);
+
+  if (!gridProducts.length) {
+    alert('Use Parse Grid to fill the table with at least one product (SKU and name).');
+    return;
+  }
 
   // Get submit button and update state
-  const submitBtn = form.querySelector('button[type="submit"]');
-  const originalBtnText = submitBtn ? submitBtn.textContent : 'Add Product';
+  const submitBtn = form?.querySelector('button[type="submit"]');
+  const originalBtnText = submitBtn ? submitBtn.textContent : 'Add Products';
 
   try {
     modalState.isSubmitting = true;
@@ -559,22 +1679,59 @@ async function handlePasteSubmit(form) {
     // Update button state
     if (submitBtn) {
       submitBtn.disabled = true;
-      submitBtn.textContent = 'Adding...';
+      submitBtn.textContent = `Adding ${gridProducts.length}...`;
     }
 
     // Ensure we have an access token
     await ensureAccessToken();
 
     if (!accessToken) {
-      throw new Error('No access token available. Please enter a token first.');
+      throw new Error(
+        'No access token available. Use Commerce settings (Retrieve bearer token or INGESTION_ACCESS_TOKEN) or sign in with DA.',
+      );
     }
 
-    // Submit to ACO API
-    const result = await submitProductToACO(productPayload, pricePayload);
-    console.log('Product created successfully:', result);
+    const batchReport = {
+      summary: { total: gridProducts.length, succeeded: 0, failed: 0 },
+      results: [],
+    };
+
+    // Submit products sequentially so one bad row does not stop all rows
+    for (const product of gridProducts) {
+      try {
+        const { productPayload, pricePayload } = buildPayloadsFromPasteGridRow(product);
+        const apiResult = await submitProductToACO(productPayload, pricePayload);
+        batchReport.summary.succeeded += 1;
+        batchReport.results.push({
+          sku: product.sku,
+          status: 'success',
+          response: apiResult,
+        });
+      } catch (error) {
+        batchReport.summary.failed += 1;
+        batchReport.results.push({
+          sku: product.sku,
+          status: 'failure',
+          error: error.message || String(error),
+        });
+      }
+    }
 
     closePasteModal();
-    showSuccessMessage(`Product "${formData.name}" added successfully!`);
+
+    openApiResponseModal({
+      title: 'Paste grid — API responses',
+      subtitle: `${batchReport.summary.succeeded} succeeded · ${batchReport.summary.failed} failed · ${batchReport.summary.total} rows`,
+      bodyText: JSON.stringify(batchReport, null, 2),
+    });
+
+    if (batchReport.summary.failed === 0) {
+      showSuccessMessage(`Added ${batchReport.summary.succeeded} products from pasted grid.`);
+    } else {
+      showSuccessMessage(
+        `Added ${batchReport.summary.succeeded} of ${batchReport.summary.total}. See API response for failures.`,
+      );
+    }
 
     // Refresh product list
     state.currentPage = 1;
@@ -592,57 +1749,957 @@ async function handlePasteSubmit(form) {
   }
 }
 
-// Token Modal functions
-function openTokenModal() {
-  const modal = document.getElementById('token-modal');
-  if (modal) {
-    modal.classList.add('is-open');
-    document.body.style.overflow = 'hidden';
-    // Reset form
-    const form = modal.querySelector('form');
-    if (form) form.reset();
-    // Focus the input
-    const input = modal.querySelector('textarea');
-    if (input) input.focus();
+function persistLocalStorageTrimmed(storageKey, raw) {
+  const v = String(raw ?? '').trim();
+  try {
+    if (v) localStorage.setItem(storageKey, v);
+    else localStorage.removeItem(storageKey);
+  } catch (e) {
+    console.error('localStorage write failed:', e);
+    throw new Error('Could not save settings to localStorage.');
   }
 }
 
-function closeTokenModal() {
-  const modal = document.getElementById('token-modal');
+/** Removes only keys written by this tool (see ACO_LS_KEYS). Does not call localStorage.clear(). */
+function removeCommerceAppLocalStorageKeys() {
+  Object.values(ACO_LS_KEYS).forEach((k) => {
+    try {
+      localStorage.removeItem(k);
+    } catch (e) {
+      console.warn('localStorage remove failed:', k, e);
+    }
+  });
+}
+
+/** Keys that count as “user configured commerce” (expiry alone does not). */
+function commerceLocalStorageKeysForPresence() {
+  return Object.values(ACO_LS_KEYS).filter((k) => k !== ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT);
+}
+
+/** True if this app has saved any Commerce Optimizer field (required before loading the catalog). */
+function hasAnyCommerceLocalStorage() {
+  return commerceLocalStorageKeysForPresence().some((key) => readLocalStorageTrimmed(key) !== '');
+}
+
+/**
+ * Sheet UI deep link (matches da.live commerce settings spreadsheet path).
+ * @see https://da.live/sheet#/<org>/<repo>/commerce/settings
+ */
+function buildDaCommerceSettingsSheetDeepLink(org, repo) {
+  return `https://da.live/sheet#/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/commerce/settings`;
+}
+
+function mergeCommerceSheetRows(parsed) {
+  const rows = [];
+  if (parsed && typeof parsed === 'object' && Array.isArray(parsed.data)) {
+    parsed.data.forEach((row) => {
+      if (row && typeof row === 'object' && !Array.isArray(row)) rows.push(row);
+    });
+  } else if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    rows.push(parsed);
+  }
+  const merged = {};
+  rows.forEach((row) => {
+    Object.keys(row).forEach((k) => {
+      if (k.startsWith(':')) return;
+      merged[k] = row[k];
+    });
+  });
+  return merged;
+}
+
+/** Map sheet row keys (CLIENT_ID or client_id, tenet_id, env, …) → env-style LS keys. */
+function normalizedCommerceSettingsRow(merged) {
+  const out = {};
+  Object.entries(merged).forEach(([k, v]) => {
+    const key = String(k).trim();
+    if (!key || key.startsWith(':')) return;
+
+    let lsKey = null;
+    if (Object.values(ACO_LS_KEYS).includes(key)) {
+      lsKey = key;
+    } else {
+      const snake = key.toLowerCase().replace(/\s+/g, '_');
+      lsKey = COMMERCE_SETTINGS_JSON_KEYS[snake];
+      if (!lsKey) {
+        const guessed = snake.split('_').map((w) => w.toUpperCase()).join('_');
+        if (Object.values(ACO_LS_KEYS).includes(guessed)) lsKey = guessed;
+      }
+    }
+    if (lsKey) out[lsKey] = v;
+  });
+  return out;
+}
+
+/** Persist commerce sheet fields using CLIENT_ID-style keys or lowercase snake_case aliases. */
+function applyCommerceSheetJsonToLocalStorage(parsed) {
+  const merged = mergeCommerceSheetRows(parsed);
+  const normalized = normalizedCommerceSettingsRow(merged);
+  let count = 0;
+  Object.values(ACO_LS_KEYS).forEach((storageKey) => {
+    const raw = normalized[storageKey];
+    if (raw == null || String(raw).trim() === '') return;
+    try {
+      persistLocalStorageTrimmed(storageKey, String(raw));
+      count += 1;
+    } catch (e) {
+      console.warn('Commerce sheet: could not persist', storageKey, e);
+    }
+  });
+  return count;
+}
+
+/**
+ * When URL query includes org & repo, load published commerce settings JSON from content.da.live
+ * (e.g. https://content.da.live/adobedrago/walgreens-storefront/commerce/settings.json).
+ * Requires a bearer token (DA SDK or IMS).
+ */
+async function hydrateCommerceSettingsFromQueryParams() {
+  let org = '';
+  let repo = '';
+  try {
+    const params = new URLSearchParams(window.location.search);
+    org = (params.get('org') || '').trim();
+    repo = (params.get('repo') || '').trim();
+  } catch {
+    return { ok: false, reason: 'params' };
+  }
+
+  if (!org || !repo) return { ok: false, reason: 'missing-org-repo' };
+  if (!accessToken) {
+    console.warn('Commerce settings sheet: skip hydrate (no access token yet).');
+    return { ok: false, reason: 'no-token' };
+  }
+
+  const sheetUi = buildDaCommerceSettingsSheetDeepLink(org, repo);
+  const url = `https://content.da.live/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/commerce/settings.json`;
+
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json,text/plain,*/*',
+      },
+    });
+    if (!res.ok) {
+      console.warn('Commerce settings sheet:', url, res.status);
+      return { ok: false, reason: 'not-found', sheetUi };
+    }
+    const text = await res.text();
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      console.warn('Commerce settings sheet: invalid JSON', e);
+      return { ok: false, reason: 'invalid-json', sheetUi };
+    }
+    const applied = applyCommerceSheetJsonToLocalStorage(parsed);
+    if (applied > 0) {
+      console.log(`Commerce settings hydrated from ${url} (${applied} fields). Sheet: ${sheetUi}`);
+      return { ok: true, applied, sheetUi };
+    }
+  } catch (e) {
+    console.warn('Commerce settings sheet fetch failed:', url, e);
+    return { ok: false, reason: 'fetch-error', sheetUi };
+  }
+
+  console.warn('Commerce settings sheet: no matching fields in JSON.', sheetUi);
+  return { ok: false, reason: 'no-fields', sheetUi };
+}
+
+function fillAcoSettingsForm(form) {
+  if (!form) return;
+  const set = (id, key) => {
+    const el = form.querySelector(id);
+    if (el) el.value = readLocalStorageTrimmed(key);
+  };
+  set('#aco-settings-client-id', ACO_LS_KEYS.CLIENT_ID);
+  set('#aco-settings-ingestion-access-token', ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+  set('#aco-settings-tenant-id', ACO_LS_KEYS.TENANT_ID);
+  set('#aco-settings-region', ACO_LS_KEYS.REGION);
+  set('#aco-settings-environment', ACO_LS_KEYS.ENVIRONMENT);
+  set('#aco-settings-catalog-view-id', ACO_LS_KEYS.CATALOG_VIEW_ID);
+  set('#aco-settings-price-book-id', ACO_LS_KEYS.PRICE_BOOK_ID);
+  set('#aco-settings-price-book-name', ACO_LS_KEYS.PRICE_BOOK_NAME);
+  set('#aco-settings-price-book-currency', ACO_LS_KEYS.PRICE_BOOK_CURRENCY);
+}
+
+function openAcoSettingsModal() {
+  const modal = document.getElementById('aco-settings-modal');
+  if (modal) {
+    purgeExpiredIngestionTokenIfNeeded();
+    modal.classList.add('is-open');
+    document.body.style.overflow = 'hidden';
+    const form = modal.querySelector('form');
+    fillAcoSettingsForm(form);
+    const first = form?.querySelector('#aco-settings-client-id');
+    if (first) first.focus();
+  }
+}
+
+function closeAcoSettingsModal() {
+  const modal = document.getElementById('aco-settings-modal');
   if (modal) {
     modal.classList.remove('is-open');
     document.body.style.overflow = '';
   }
 }
 
-async function handleTokenSubmit(form) {
-  const tokenInput = form.querySelector('#bearer-token');
-  const token = tokenInput.value.trim();
+function readExpiresInSecondsFromObject(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  const candidates = [obj.expires_in, obj.expiresIn, obj.expires];
+  for (const c of candidates) {
+    if (c == null) continue;
+    const n = Number(c);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
 
-  if (!token) {
-    alert('Please enter a bearer token');
+/**
+ * Parse Fusion / proxy JSON (or raw JWT) into token and optional expires_in (seconds, OAuth-style).
+ * @returns {{ token: string, expiresInSec: number | null }}
+ */
+function parseFusionTokenResponse(text) {
+  const trimmed = String(text ?? '').trim();
+  if (!trimmed) return { token: '', expiresInSec: null };
+  try {
+    const j = JSON.parse(trimmed);
+    if (typeof j === 'string') {
+      return { token: j.trim(), expiresInSec: null };
+    }
+    let expiresInSec =
+      readExpiresInSecondsFromObject(j)
+      || readExpiresInSecondsFromObject(j.body)
+      || readExpiresInSecondsFromObject(j.data);
+    const direct =
+      j.access_token
+      || j.accessToken
+      || j.token
+      || j.bearer
+      || (j.body && (j.body.access_token || j.body.token || j.body.accessToken));
+    if (typeof direct === 'string' && direct.trim()) {
+      return { token: direct.trim(), expiresInSec };
+    }
+    if (j.data && typeof j.data === 'object') {
+      const d = j.data.access_token || j.data.token || j.data.accessToken;
+      if (typeof d === 'string' && d.trim()) {
+        const innerExp =
+          readExpiresInSecondsFromObject(j.data) || (expiresInSec == null ? null : expiresInSec);
+        return { token: d.trim(), expiresInSec: innerExp };
+      }
+    }
+  } catch (_) {
+    /* fall through */
+  }
+  if (/^eyJ/i.test(trimmed)) return { token: trimmed, expiresInSec: null };
+  return { token: '', expiresInSec: null };
+}
+
+function extractAccessTokenFromHookResponseBody(text) {
+  return parseFusionTokenResponse(text).token;
+}
+
+/**
+ * If stored ingestion token is past INGESTION_ACCESS_TOKEN_EXPIRES_AT, remove it from localStorage.
+ * Clears in-memory accessToken when it matched the removed token. Syncs settings textarea if open.
+ * @returns {boolean} True when something was removed.
+ */
+function purgeExpiredIngestionTokenIfNeeded() {
+  const tok = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+  const expRaw = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT);
+  const expMs = expRaw ? Number(expRaw) : NaN;
+  const hasValidExpiry = Number.isFinite(expMs) && expMs > 0;
+  const expired = hasValidExpiry && Date.now() >= expMs;
+
+  if (!expired) {
+    if (!tok && hasValidExpiry) {
+      try {
+        localStorage.removeItem(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT);
+      } catch (e) {
+        console.warn('localStorage remove failed:', ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT, e);
+      }
+    }
+    return false;
+  }
+
+  try {
+    localStorage.removeItem(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+    localStorage.removeItem(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT);
+  } catch (e) {
+    console.warn('Could not clear expired ingestion token:', e);
+  }
+
+  if (accessToken && tok && accessToken === tok) {
+    accessToken = null;
+  }
+
+  const modal = document.getElementById('aco-settings-modal');
+  const ta = modal?.querySelector('#aco-settings-ingestion-access-token');
+  if (ta) ta.value = '';
+
+  return true;
+}
+
+/**
+ * POST { client_id } to Adobe Fusion hook; stores result in INGESTION_ACCESS_TOKEN and in-memory accessToken.
+ */
+async function retrieveBearerTokenViaFusion(form) {
+  const clientId = (form.querySelector('#aco-settings-client-id')?.value ?? '').trim();
+  if (!clientId) {
+    alert('Enter CLIENT_ID first.');
     return;
   }
 
-  // Remove "Bearer " prefix if present
-  accessToken = token.replace(/^Bearer\s+/i, '');
-  userProvidedToken = true; // Mark that user manually entered this token
+  purgeExpiredIngestionTokenIfNeeded();
 
-  // Save to sessionStorage for persistence
+  const btn = form.querySelector('#aco-settings-retrieve-token-btn');
+  const prev = btn?.textContent;
   try {
-    sessionStorage.setItem('aco_access_token', accessToken);
-    console.log('Token saved to sessionStorage');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Retrieving...';
+    }
+
+    const res = await fetch(FUSION_INGESTION_TOKEN_HOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: clientId }),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`Token request failed: ${res.status} - ${text.slice(0, 400)}`);
+    }
+
+    const { token, expiresInSec } = parseFusionTokenResponse(text);
+    if (!token) {
+      throw new Error(
+        'Could not find a bearer token in the response. Expected JSON with access_token (or token), or a raw JWT string.',
+      );
+    }
+
+    persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN, token);
+    if (expiresInSec != null && Number.isFinite(expiresInSec) && expiresInSec > 0) {
+      const expiresAtMs = Date.now() + Math.floor(expiresInSec * 1000);
+      persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT, String(expiresAtMs));
+    } else {
+      persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT, '');
+    }
+    const ta = form.querySelector('#aco-settings-ingestion-access-token');
+    if (ta) ta.value = token;
+    accessToken = token;
+    acoRuntime = buildAcoRuntimeConfig();
+
+    const listContainer = document.getElementById('product-list-container');
+    if (listContainer) renderAcoConfigBanner(listContainer);
+
+    showSuccessMessage('Bearer token saved to INGESTION_ACCESS_TOKEN.');
   } catch (e) {
-    console.warn('Could not save token to sessionStorage:', e);
+    alert(e?.message || String(e));
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = prev || 'Retrieve bearer token';
+    }
+  }
+}
+
+/**
+ * Build FeedPricebook body from current Commerce settings form values (aco-ts-sdk shape).
+ */
+function buildFeedPricebookFromSettingsForm(form) {
+  const val = (sel) => (form.querySelector(sel)?.value ?? '').trim();
+  const priceBookId = val('#aco-settings-price-book-id') || getDefaultPriceBook();
+  if (!priceBookId) {
+    throw new Error('Set PRICE_BOOK_ID before creating a price book.');
+  }
+  const nameRaw = val('#aco-settings-price-book-name');
+  const name = nameRaw || priceBookId;
+  const curRaw = val('#aco-settings-price-book-currency');
+  const currency = (curRaw || DEFAULT_PRICE_BOOK_CURRENCY).toUpperCase();
+  return { priceBookId, name, currency };
+}
+
+/**
+ * POST …/v1/catalog/price-books — equivalent to @adobe-commerce/aco-ts-sdk createPriceBooks (REST only in this tool).
+ */
+async function submitPriceBooksToACO(priceBooks) {
+  const bearer = await getBearerForCatalogWrite();
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${bearer}`,
+  };
+  const response = await fetch(acoRuntime.priceBooksEndpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(priceBooks),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to create price books: ${response.status} - ${errorText}`);
+  }
+  return response.json();
+}
+
+/**
+ * Parse JSON like https://github.com/adobe-commerce/aco-sample-catalog-data-ingestion/blob/main/data/pricebooks.json
+ * @param {string} text
+ * @returns {Array<{ priceBookId: string, name: string, currency: string }>}
+ */
+function parsePriceBooksJsonText(text) {
+  const s = String(text ?? '').trim();
+  if (!s) throw new Error('Paste JSON or choose a pricebooks.json file.');
+  let parsed;
+  try {
+    parsed = JSON.parse(s);
+  } catch (e) {
+    throw new Error(`Invalid JSON: ${e.message}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(
+      'Expected a JSON array of price books (see aco-sample-catalog-data-ingestion data/pricebooks.json).',
+    );
+  }
+  const out = [];
+  parsed.forEach((row, i) => {
+    if (!row || typeof row !== 'object') {
+      throw new Error(`Index ${i}: expected an object with priceBookId, name, currency.`);
+    }
+    const priceBookId = String(row.priceBookId ?? '').trim();
+    if (!priceBookId) {
+      throw new Error(`Index ${i}: priceBookId is required.`);
+    }
+    const name = String(row.name ?? '').trim() || priceBookId;
+    const currency = String(row.currency ?? '').trim().toUpperCase() || DEFAULT_PRICE_BOOK_CURRENCY;
+    out.push({ priceBookId, name, currency });
+  });
+  return out;
+}
+
+function setPriceBooksIngestUiBusy(form, busy) {
+  if (!form) return;
+  const sel = [
+    '#aco-settings-ingest-pricebooks-paste-btn',
+    '#aco-settings-ingest-pricebooks-file-btn',
+    '#aco-settings-pricebooks-json-file',
+    '#aco-settings-create-price-book-btn',
+  ];
+  sel.forEach((q) => {
+    const el = form.querySelector(q);
+    if (el) el.disabled = busy;
+  });
+}
+
+async function handleAcoSettingsIngestPriceBooksJson(form, rawText) {
+  let priceBooks;
+  try {
+    priceBooks = parsePriceBooksJsonText(rawText);
+  } catch (e) {
+    alert(e?.message || String(e));
+    return;
+  }
+  if (!priceBooks.length) {
+    alert('The array is empty.');
+    return;
   }
 
-  console.log('Token updated successfully (user-provided)');
-  console.log('New access token:', accessToken.substring(0, 50) + '...');
+  setPriceBooksIngestUiBusy(form, true);
+  const report = {
+    batchSize: PRICE_BOOKS_INGEST_BATCH_SIZE,
+    total: priceBooks.length,
+    batches: [],
+  };
+  try {
+    for (let i = 0; i < priceBooks.length; i += PRICE_BOOKS_INGEST_BATCH_SIZE) {
+      const batch = priceBooks.slice(i, i + PRICE_BOOKS_INGEST_BATCH_SIZE);
+      const batchNumber = Math.floor(i / PRICE_BOOKS_INGEST_BATCH_SIZE) + 1;
+      const response = await submitPriceBooksToACO(batch);
+      report.batches.push({ batchNumber, count: batch.length, response });
+    }
+    openApiResponseModal({
+      title: 'Ingest price books — API responses',
+      subtitle: `${report.total} item(s) · ${report.batches.length} batch(es) · up to ${PRICE_BOOKS_INGEST_BATCH_SIZE} per request`,
+      bodyText: JSON.stringify(report, null, 2),
+    });
+  } catch (error) {
+    openApiResponseModal({
+      title: 'Ingest price books — API error',
+      subtitle: error?.message || String(error),
+      bodyText: JSON.stringify(
+        {
+          completedBatchesBeforeFailure: report.batches,
+          note: 'Batches are applied in order; later batches did not run after this error.',
+          error: error?.message || String(error),
+        },
+        null,
+        2,
+      ),
+    });
+  } finally {
+    setPriceBooksIngestUiBusy(form, false);
+  }
+}
 
-  closeTokenModal();
+async function handleAcoSettingsCreatePriceBook(form, btn) {
+  if (!form || !btn) return;
+  const prev = btn.textContent;
+  let payload = null;
+  try {
+    try {
+      payload = buildFeedPricebookFromSettingsForm(form);
+    } catch (e) {
+      alert(e?.message || String(e));
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Creating…';
+    const result = await submitPriceBooksToACO([payload]);
+    openApiResponseModal({
+      title: 'Create price book — API response',
+      subtitle: `Success · ${payload.priceBookId}`,
+      bodyText: JSON.stringify(result, null, 2),
+    });
+  } catch (error) {
+    const detail =
+      `${error?.message || String(error)}${error?.cause ? `\n\ncause: ${error.cause}` : ''}`;
+    openApiResponseModal({
+      title: 'Create price book — API error',
+      subtitle: payload?.priceBookId ?? '',
+      bodyText: detail,
+    });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prev || 'Create price book';
+  }
+}
 
-  // Show success message
-  alert('Token saved successfully! This token will be used for all API calls.');
+async function handleAcoSettingsSubmit(form) {
+  const val = (sel) => (form.querySelector(sel)?.value ?? '').trim();
+
+  const prevIngestionTok = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+  const newIngestionTok = val('#aco-settings-ingestion-access-token');
+
+  persistLocalStorageTrimmed(ACO_LS_KEYS.CLIENT_ID, val('#aco-settings-client-id'));
+  persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN, newIngestionTok);
+  if (!newIngestionTok) {
+    persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT, '');
+  } else if (newIngestionTok !== prevIngestionTok) {
+    persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT, '');
+  }
+  persistLocalStorageTrimmed(ACO_LS_KEYS.TENANT_ID, val('#aco-settings-tenant-id'));
+  persistLocalStorageTrimmed(ACO_LS_KEYS.REGION, val('#aco-settings-region'));
+  persistLocalStorageTrimmed(ACO_LS_KEYS.ENVIRONMENT, val('#aco-settings-environment'));
+  persistLocalStorageTrimmed(ACO_LS_KEYS.CATALOG_VIEW_ID, val('#aco-settings-catalog-view-id'));
+  persistLocalStorageTrimmed(ACO_LS_KEYS.PRICE_BOOK_ID, val('#aco-settings-price-book-id'));
+  persistLocalStorageTrimmed(ACO_LS_KEYS.PRICE_BOOK_NAME, val('#aco-settings-price-book-name'));
+  persistLocalStorageTrimmed(ACO_LS_KEYS.PRICE_BOOK_CURRENCY, val('#aco-settings-price-book-currency'));
+
+  acoRuntime = buildAcoRuntimeConfig();
+
+  if (!getPriceBookOptionsForFilter().includes(state.selectedPriceBook)) {
+    state.selectedPriceBook = getDefaultPriceBook();
+  }
+
+  if (acoRuntime.hasImsClientCredentials) {
+    try {
+      accessToken = await requestAccessToken();
+      console.log('Refreshed IMS access token after settings save');
+    } catch (e) {
+      console.warn('Could not refresh IMS token after settings save:', e);
+    }
+  } else {
+    const ingSaved = val('#aco-settings-ingestion-access-token');
+    if (ingSaved) accessToken = ingSaved;
+  }
+
+  const listContainer = document.getElementById('product-list-container');
+  if (listContainer) renderAcoConfigBanner(listContainer);
+
+  state.currentPage = 1;
+  refreshPriceBookFilterSelect();
+  await loadProducts();
+
+  closeAcoSettingsModal();
+  showSuccessMessage('Commerce Optimizer settings saved.');
+}
+
+/**
+ * Remove Commerce Optimizer keys stored by this app (ACO_LS_KEYS only). Refreshes in-app defaults.
+ */
+async function handleClearAppLocalStorage() {
+  if (
+    !confirm(
+      'Remove all Commerce Optimizer settings saved by this tool (CLIENT_ID, CLIENT_SECRET, INGESTION_ACCESS_TOKEN, token expiry, TENANT_ID, REGION, ENVIRONMENT, CATALOG_VIEW_ID, PRICE_BOOK_ID, PRICE_BOOK_NAME, PRICE_BOOK_CURRENCY)? Other sites’ localStorage data will not be touched.',
+    )
+  ) {
+    return;
+  }
+
+  removeCommerceAppLocalStorageKeys();
+
+  acoRuntime = buildAcoRuntimeConfig();
+
+  const settingsForm = document.querySelector('#aco-settings-modal form');
+  fillAcoSettingsForm(settingsForm);
+
+  if (!getPriceBookOptionsForFilter().includes(state.selectedPriceBook)) {
+    state.selectedPriceBook = getDefaultPriceBook();
+  }
+
+  state.currentPage = 1;
+  refreshPriceBookFilterSelect();
+
+  const listContainer = document.getElementById('product-list-container');
+  if (listContainer) renderAcoConfigBanner(listContainer);
+
+  await loadProducts();
+  showSuccessMessage('Saved Commerce Optimizer keys cleared.');
+}
+
+async function handleAcoSettingsClear(form) {
+  if (!confirm('Remove all saved Commerce Optimizer keys from this browser?')) return;
+
+  removeCommerceAppLocalStorageKeys();
+
+  acoRuntime = buildAcoRuntimeConfig();
+  fillAcoSettingsForm(form);
+
+  if (acoRuntime.hasImsClientCredentials) {
+    try {
+      accessToken = await requestAccessToken();
+    } catch (e) {
+      console.warn('IMS token after clear:', e);
+    }
+  }
+
+  const listContainer = document.getElementById('product-list-container');
+  if (listContainer) renderAcoConfigBanner(listContainer);
+
+  if (!getPriceBookOptionsForFilter().includes(state.selectedPriceBook)) {
+    state.selectedPriceBook = getDefaultPriceBook();
+  }
+
+  state.currentPage = 1;
+  refreshPriceBookFilterSelect();
+  await loadProducts();
+  showSuccessMessage('Saved Commerce Optimizer keys cleared.');
+}
+
+function createAcoSettingsField(
+  form,
+  { id, label, help, type = 'text', placeholder = '', autocomplete = 'off', textarea = false, rows = 4 },
+) {
+  const group = document.createElement('div');
+  group.className = 'plp-form-group';
+
+  const lab = document.createElement('label');
+  lab.className = 'plp-form-label';
+  lab.setAttribute('for', id);
+  lab.textContent = label;
+
+  const helpEl = document.createElement('p');
+  helpEl.className = 'plp-form-help';
+  helpEl.textContent = help;
+
+  let control;
+  if (textarea) {
+    control = document.createElement('textarea');
+    control.id = id;
+    control.className = 'plp-form-textarea';
+    control.placeholder = placeholder;
+    control.rows = rows;
+    control.spellcheck = false;
+    control.autocomplete = 'off';
+  } else {
+    control = document.createElement('input');
+    control.id = id;
+    control.className = 'plp-form-input';
+    control.type = type;
+    control.placeholder = placeholder;
+    control.autocomplete = autocomplete;
+  }
+
+  group.appendChild(lab);
+  group.appendChild(helpEl);
+  group.appendChild(control);
+  form.appendChild(group);
+}
+
+function createAcoSettingsModal() {
+  const modal = document.createElement('div');
+  modal.id = 'aco-settings-modal';
+  modal.className = 'plp-modal';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'plp-modal-overlay';
+  overlay.addEventListener('click', closeAcoSettingsModal);
+
+  const dialog = document.createElement('div');
+  dialog.className = 'plp-modal-dialog plp-modal-dialog-large';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-labelledby', 'aco-settings-modal-title');
+
+  const header = document.createElement('div');
+  header.className = 'plp-modal-header';
+
+  const title = document.createElement('h2');
+  title.id = 'aco-settings-modal-title';
+  title.className = 'plp-modal-title';
+  title.textContent = 'Commerce Optimizer settings';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'plp-modal-close';
+  closeBtn.setAttribute('aria-label', 'Close modal');
+  closeBtn.appendChild(createIcon('close'));
+  closeBtn.addEventListener('click', closeAcoSettingsModal);
+
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+
+  const body = document.createElement('div');
+  body.className = 'plp-modal-body';
+
+  const intro = document.createElement('p');
+  intro.className = 'plp-form-help plp-settings-intro';
+  intro.textContent =
+    'Values are stored in localStorage (CLIENT_ID, INGESTION_ACCESS_TOKEN, tenant/region/env, catalog view, price book id/name/currency). Use Retrieve bearer token to POST your CLIENT_ID to Fusion and fill INGESTION_ACCESS_TOKEN, or paste a token from Developer Console.';
+
+  const form = document.createElement('form');
+  form.className = 'plp-modal-form';
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const submitBtn = form.querySelector('button[type="submit"]');
+    const prev = submitBtn?.textContent;
+    try {
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Saving...';
+      }
+      await handleAcoSettingsSubmit(form);
+    } catch (err) {
+      alert(err?.message || String(err));
+    } finally {
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = prev || 'Save';
+      }
+    }
+  });
+
+  body.appendChild(intro);
+  body.appendChild(form);
+
+  createAcoSettingsField(form, {
+    id: 'aco-settings-client-id',
+    label: 'CLIENT_ID',
+    help: 'IMS OAuth client id from Adobe Developer Console (Server-to-Server). Used with Retrieve bearer token.',
+    placeholder: 'my-client-id',
+    autocomplete: 'username',
+  });
+
+  const retrieveGroup = document.createElement('div');
+  retrieveGroup.className = 'plp-form-group';
+  const retrieveLab = document.createElement('label');
+  retrieveLab.className = 'plp-form-label';
+  retrieveLab.setAttribute('for', 'aco-settings-retrieve-token-btn');
+  retrieveLab.textContent = 'Bearer token';
+  const retrieveHelp = document.createElement('p');
+  retrieveHelp.className = 'plp-form-help';
+  retrieveHelp.textContent =
+    'POSTs { client_id } to Adobe Fusion and saves the returned bearer into INGESTION_ACCESS_TOKEN. If the response includes expires_in (seconds), the token is removed from localStorage automatically after that time.';
+  const retrieveBtn = document.createElement('button');
+  retrieveBtn.type = 'button';
+  retrieveBtn.id = 'aco-settings-retrieve-token-btn';
+  retrieveBtn.className = 'plp-button plp-button-secondary';
+  retrieveBtn.textContent = 'Retrieve bearer token';
+  retrieveBtn.addEventListener('click', async () => {
+    await retrieveBearerTokenViaFusion(form);
+  });
+  retrieveGroup.appendChild(retrieveLab);
+  retrieveGroup.appendChild(retrieveHelp);
+  retrieveGroup.appendChild(retrieveBtn);
+  form.appendChild(retrieveGroup);
+
+  createAcoSettingsField(form, {
+    id: 'aco-settings-ingestion-access-token',
+    label: 'INGESTION_ACCESS_TOKEN',
+    textarea: true,
+    rows: 4,
+    help:
+      'Bearer for Data Ingestion REST (commerce.aco.ingestion). Filled by Retrieve bearer token or paste from Developer Console → Generate Access Token.',
+    placeholder: 'Paste bearer token (eyJ…)',
+  });
+  createAcoSettingsField(form, {
+    id: 'aco-settings-tenant-id',
+    label: 'TENANT_ID',
+    help: 'Commerce Optimizer tenant id from Cloud Manager / API URLs.',
+    placeholder: DEFAULT_TENANT_ID,
+  });
+  createAcoSettingsField(form, {
+    id: 'aco-settings-region',
+    label: 'REGION',
+    help: 'Region segment in the API host (e.g. na1).',
+    placeholder: DEFAULT_REGION,
+  });
+  createAcoSettingsField(form, {
+    id: 'aco-settings-environment',
+    label: 'ENVIRONMENT',
+    help: 'sandbox or production.',
+    placeholder: DEFAULT_ENVIRONMENT,
+  });
+  createAcoSettingsField(form, {
+    id: 'aco-settings-catalog-view-id',
+    label: 'CATALOG_VIEW_ID',
+    help: 'Catalog view UUID used as ac_environment_id for product search GraphQL.',
+    placeholder: DEFAULT_CATALOG_VIEW_ID,
+  });
+  createAcoSettingsField(form, {
+    id: 'aco-settings-price-book-id',
+    label: 'PRICE_BOOK_ID',
+    help:
+      'Id used for price ingestion and PLP filter (ac-price-book-id). This book must already exist in your catalog, or create it below via Data Ingestion (same as @adobe-commerce/aco-ts-sdk createPriceBooks). Per-row Price book column is not used on upload.',
+    placeholder: DEFAULT_PRICE_BOOK_FALLBACK,
+  });
+  createAcoSettingsField(form, {
+    id: 'aco-settings-price-book-name',
+    label: 'PRICE_BOOK_NAME',
+    help:
+      'Optional display name when creating the price book via API. If empty, the id above is used as the name.',
+    placeholder: 'e.g. Default price book',
+  });
+  createAcoSettingsField(form, {
+    id: 'aco-settings-price-book-currency',
+    label: 'PRICE_BOOK_CURRENCY',
+    help: `ISO currency for Create price book (defaults to ${DEFAULT_PRICE_BOOK_CURRENCY} if empty).`,
+    placeholder: DEFAULT_PRICE_BOOK_CURRENCY,
+  });
+
+  const priceBookApiGroup = document.createElement('div');
+  priceBookApiGroup.className = 'plp-form-group';
+  const priceBookApiLab = document.createElement('label');
+  priceBookApiLab.className = 'plp-form-label';
+  priceBookApiLab.setAttribute('for', 'aco-settings-create-price-book-btn');
+  priceBookApiLab.textContent = 'Price book (Data Ingestion)';
+  const priceBookApiHelp = document.createElement('p');
+  priceBookApiHelp.className = 'plp-form-help';
+  priceBookApiHelp.textContent =
+    'POSTs one FeedPricebook to …/v1/catalog/price-books using PRICE_BOOK_ID, PRICE_BOOK_NAME, and PRICE_BOOK_CURRENCY from the fields above (saved values are not required—current field values are used). Requires ingestion bearer. For many books at once, use Ingest price books (pricebooks.json) below—same as aco-sample-catalog-data-ingestion index.js ingestPriceBooks.';
+  const createPriceBookBtn = document.createElement('button');
+  createPriceBookBtn.type = 'button';
+  createPriceBookBtn.id = 'aco-settings-create-price-book-btn';
+  createPriceBookBtn.className = 'plp-button plp-button-secondary';
+  createPriceBookBtn.textContent = 'Create price book';
+  createPriceBookBtn.addEventListener('click', async () => {
+    await handleAcoSettingsCreatePriceBook(form, createPriceBookBtn);
+  });
+  priceBookApiGroup.appendChild(priceBookApiLab);
+  priceBookApiGroup.appendChild(priceBookApiHelp);
+  priceBookApiGroup.appendChild(createPriceBookBtn);
+  form.appendChild(priceBookApiGroup);
+
+  const priceBooksJsonGroup = document.createElement('div');
+  priceBooksJsonGroup.className = 'plp-form-group';
+  const priceBooksJsonLab = document.createElement('label');
+  priceBooksJsonLab.className = 'plp-form-label';
+  priceBooksJsonLab.setAttribute('for', 'aco-settings-pricebooks-json-paste');
+  priceBooksJsonLab.textContent = 'Ingest price books (pricebooks.json)';
+  const priceBooksJsonHelp = document.createElement('p');
+  priceBooksJsonHelp.className = 'plp-form-help';
+  priceBooksJsonHelp.textContent =
+    'Same JSON array as aco-sample-catalog-data-ingestion data/pricebooks.json (priceBookId, name, currency per row). POSTed in batches of 100 to …/v1/catalog/price-books, matching the sample repo createPriceBooks loop.';
+  const priceBooksJsonTa = document.createElement('textarea');
+  priceBooksJsonTa.id = 'aco-settings-pricebooks-json-paste';
+  priceBooksJsonTa.className = 'plp-form-input plp-form-textarea';
+  priceBooksJsonTa.rows = 5;
+  priceBooksJsonTa.spellcheck = false;
+  priceBooksJsonTa.placeholder =
+    '[ { "priceBookId": "west_coast_inc", "name": "West coast Inc. price book", "currency": "USD" }, … ]';
+  const priceBooksIngestRow = document.createElement('div');
+  priceBooksIngestRow.className = 'plp-settings-pricebooks-ingest-row';
+  const ingestPriceBooksPasteBtn = document.createElement('button');
+  ingestPriceBooksPasteBtn.type = 'button';
+  ingestPriceBooksPasteBtn.id = 'aco-settings-ingest-pricebooks-paste-btn';
+  ingestPriceBooksPasteBtn.className = 'plp-button plp-button-secondary';
+  ingestPriceBooksPasteBtn.textContent = 'Ingest pasted JSON';
+  ingestPriceBooksPasteBtn.addEventListener('click', async () => {
+    const ta = form.querySelector('#aco-settings-pricebooks-json-paste');
+    await handleAcoSettingsIngestPriceBooksJson(form, ta?.value ?? '');
+  });
+  const pricebooksJsonFileInput = document.createElement('input');
+  pricebooksJsonFileInput.type = 'file';
+  pricebooksJsonFileInput.id = 'aco-settings-pricebooks-json-file';
+  pricebooksJsonFileInput.accept = 'application/json,.json';
+  pricebooksJsonFileInput.setAttribute('aria-hidden', 'true');
+  pricebooksJsonFileInput.tabIndex = -1;
+  pricebooksJsonFileInput.style.cssText = 'position:absolute;width:0;height:0;opacity:0;';
+  pricebooksJsonFileInput.addEventListener('change', async (ev) => {
+    const input = ev.target;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    let text;
+    try {
+      text = await file.text();
+    } catch (e) {
+      alert(e?.message || String(e));
+      return;
+    }
+    await handleAcoSettingsIngestPriceBooksJson(form, text);
+  });
+  const ingestPriceBooksFileBtn = document.createElement('button');
+  ingestPriceBooksFileBtn.type = 'button';
+  ingestPriceBooksFileBtn.id = 'aco-settings-ingest-pricebooks-file-btn';
+  ingestPriceBooksFileBtn.className = 'plp-button plp-button-secondary';
+  ingestPriceBooksFileBtn.textContent = 'Choose pricebooks.json & ingest';
+  ingestPriceBooksFileBtn.addEventListener('click', () => pricebooksJsonFileInput.click());
+  priceBooksIngestRow.appendChild(ingestPriceBooksPasteBtn);
+  priceBooksIngestRow.appendChild(ingestPriceBooksFileBtn);
+  priceBooksIngestRow.appendChild(pricebooksJsonFileInput);
+  priceBooksJsonGroup.appendChild(priceBooksJsonLab);
+  priceBooksJsonGroup.appendChild(priceBooksJsonHelp);
+  priceBooksJsonGroup.appendChild(priceBooksJsonTa);
+  priceBooksJsonGroup.appendChild(priceBooksIngestRow);
+  form.appendChild(priceBooksJsonGroup);
+
+  const footer = document.createElement('div');
+  footer.className = 'plp-modal-footer plp-settings-modal-footer';
+
+  const clearBtn = document.createElement('button');
+  clearBtn.type = 'button';
+  clearBtn.className = 'plp-button plp-button-secondary';
+  clearBtn.textContent = 'Clear saved keys';
+  clearBtn.addEventListener('click', async () => {
+    try {
+      await handleAcoSettingsClear(form);
+    } catch (err) {
+      alert(err?.message || String(err));
+    }
+  });
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'plp-button plp-button-secondary';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', closeAcoSettingsModal);
+
+  const submitBtn = document.createElement('button');
+  submitBtn.type = 'submit';
+  submitBtn.className = 'plp-button';
+  submitBtn.textContent = 'Save';
+
+  footer.appendChild(clearBtn);
+  footer.appendChild(cancelBtn);
+  footer.appendChild(submitBtn);
+  form.appendChild(footer);
+
+  dialog.appendChild(header);
+  dialog.appendChild(body);
+  modal.appendChild(overlay);
+  modal.appendChild(dialog);
+
+  return modal;
 }
 
 // Edit Modal functions
@@ -744,7 +2801,9 @@ function buildProductUpdatePayload(sku, formData) {
   // Only include fields that have values
   if (formData.name) payload.name = formData.name;
   if (formData.description) payload.description = formData.description;
-  if (formData.shortDescription) payload.shortDescription = formData.shortDescription;
+  const shortEffective =
+    String(formData.shortDescription ?? '').trim() || String(formData.description ?? '').trim();
+  if (shortEffective) payload.shortDescription = shortEffective;
 
   // Handle image update
   // Valid roles: BASE, SMALL, THUMBNAIL, SWATCH
@@ -756,26 +2815,16 @@ function buildProductUpdatePayload(sku, formData) {
     }];
   }
 
-  // Handle category as attribute with proper ACO format
+  const updateAttrSources = [];
   if (formData.category) {
-    payload.attributes = payload.attributes || [];
-    payload.attributes.push({
-      code: 'category',
-      type: 'STRING',
-      values: [formData.category],
-    });
+    updateAttrSources.push({ code: 'category', values: [String(formData.category).trim()] });
   }
-
-  // Handle additional attributes if provided
   if (formData.attributes && formData.attributes.length > 0) {
-    payload.attributes = payload.attributes || [];
-    formData.attributes.forEach((attr) => {
-      payload.attributes.push({
-        code: attr.code,
-        type: attr.type || 'STRING',
-        values: Array.isArray(attr.values) ? attr.values : [attr.value || attr.values],
-      });
-    });
+    formData.attributes.forEach((attr) => updateAttrSources.push(attr));
+  }
+  const normalizedUpdateAttrs = normalizeAttributesForIngestion(updateAttrSources);
+  if (normalizedUpdateAttrs.length > 0) {
+    payload.attributes = normalizedUpdateAttrs;
   }
 
   // Handle meta tags
@@ -797,27 +2846,22 @@ function buildProductUpdatePayload(sku, formData) {
  * PATCH https://na1-sandbox.api.commerce.adobe.com/{{tenantId}}
  */
 async function updateProductInACO(productPayload) {
-  // Ensure we have an access token
-  await ensureAccessToken();
+  const bearer = await getBearerForCatalogWrite();
 
-  if (!accessToken) {
-    throw new Error('No access token available. Please ensure you are authenticated.');
-  }
-
-  console.log('Using access token for update:', accessToken.substring(0, 50) + '...');
+  console.log('Using access token for update:', bearer.substring(0, 50) + '...');
 
   const headers = {
     'Content-Type': 'application/json',
-    Authorization: `Bearer ${accessToken}`,
+    Authorization: `Bearer ${bearer}`,
   };
 
   console.log('Request headers:', headers);
 
   try {
     console.log('Updating product in ACO...', productPayload);
-    console.log('PATCH URL:', ACO_PRODUCTS_ENDPOINT);
+    console.log('PATCH URL:', acoRuntime.productsEndpoint);
 
-    const response = await fetch(ACO_PRODUCTS_ENDPOINT, {
+    const response = await fetch(acoRuntime.productsEndpoint, {
       method: 'PATCH',
       headers,
       body: JSON.stringify([productPayload]), // API expects an array
@@ -840,40 +2884,55 @@ async function updateProductInACO(productPayload) {
 }
 
 /**
- * Delete product via ACO API
- * POST https://na1-sandbox.api.commerce.adobe.com/{{tenantId}}/v1/catalog/products/delete
+ * Parse comma- or newline-separated SKU text into a deduplicated ordered list.
  */
-async function deleteProductFromACO(sku) {
-  // Ensure we have an access token
-  await ensureAccessToken();
+function parseSkuListFromInput(raw) {
+  const text = String(raw ?? '');
+  const parts = text.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  parts.forEach((sku) => {
+    if (!seen.has(sku)) {
+      seen.add(sku);
+      out.push(sku);
+    }
+  });
+  return out;
+}
 
-  if (!accessToken) {
-    throw new Error('No access token available. Please ensure you are authenticated.');
+/**
+ * Delete one or more products via ACO API
+ * POST https://na1-sandbox.api.commerce.adobe.com/{{tenantId}}/v1/catalog/products/delete
+ * @param {string[]} skus Non-empty list of SKUs
+ */
+async function deleteProductsFromACO(skus) {
+  const list = Array.isArray(skus) ? skus.map((s) => String(s).trim()).filter(Boolean) : [];
+  if (!list.length) {
+    throw new Error('No SKUs to delete.');
   }
 
+  const bearer = await getBearerForCatalogWrite();
+
   console.log('=== DELETE REQUEST ===');
-  console.log('User-provided token:', userProvidedToken);
-  console.log('Using access token for delete:', accessToken.substring(0, 50) + '...');
+  console.log('Using access token for delete:', bearer.substring(0, 50) + '...');
 
   const headers = {
     'Content-Type': 'application/json',
-    Authorization: `Bearer ${accessToken}`,
+    Authorization: `Bearer ${bearer}`,
   };
 
-  const deletePayload = [
-    {
-      sku,
-      source: {
-        locale: DEFAULT_LOCALE,
-      },
+  const deletePayload = list.map((sku) => ({
+    sku,
+    source: {
+      locale: DEFAULT_LOCALE,
     },
-  ];
+  }));
 
   try {
-    console.log('Deleting product from ACO...', deletePayload);
-    console.log('DELETE URL:', ACO_PRODUCTS_DELETE_ENDPOINT);
+    console.log('Deleting product(s) from ACO...', deletePayload);
+    console.log('DELETE URL:', acoRuntime.productsDeleteEndpoint);
 
-    const response = await fetch(ACO_PRODUCTS_DELETE_ENDPOINT, {
+    const response = await fetch(acoRuntime.productsDeleteEndpoint, {
       method: 'POST',
       headers,
       body: JSON.stringify(deletePayload),
@@ -882,7 +2941,7 @@ async function deleteProductFromACO(sku) {
     if (!response.ok) {
       const errorText = await response.text();
       console.error('Product delete failed:', errorText);
-      throw new Error(`Failed to delete product: ${response.status} - ${errorText}`);
+      throw new Error(`Failed to delete product(s): ${response.status} - ${errorText}`);
     }
 
     const result = await response.json();
@@ -890,9 +2949,13 @@ async function deleteProductFromACO(sku) {
 
     return result;
   } catch (error) {
-    console.error('Error deleting product from ACO:', error);
+    console.error('Error deleting product(s) from ACO:', error);
     throw error;
   }
+}
+
+async function deleteProductFromACO(sku) {
+  return deleteProductsFromACO([sku]);
 }
 
 /**
@@ -929,6 +2992,173 @@ async function handleProductDelete(product, cardElement) {
     cardElement.classList.remove('plp-card-deleting');
     alert(`Failed to delete product: ${error.message}`);
   }
+}
+
+function closeDeleteBySkuModal() {
+  const modal = document.getElementById('delete-by-sku-modal');
+  if (modal) {
+    modal.classList.remove('is-open');
+    document.body.style.overflow = '';
+    const input = modal.querySelector('#delete-by-sku-input');
+    if (input) input.value = '';
+  }
+}
+
+function openDeleteBySkuModal() {
+  const modal = document.getElementById('delete-by-sku-modal');
+  if (modal) {
+    modal.classList.add('is-open');
+    document.body.style.overflow = 'hidden';
+    const input = modal.querySelector('#delete-by-sku-input');
+    if (input) {
+      input.focus();
+      input.select();
+    }
+  }
+}
+
+async function handleDeleteBySkuFormSubmit(form) {
+  const input = form.querySelector('#delete-by-sku-input');
+  const skus = parseSkuListFromInput(input?.value ?? '');
+  if (!skus.length) {
+    alert('Enter one or more SKUs (comma-separated).');
+    return;
+  }
+
+  const previewLimit = 12;
+  const preview =
+    skus.length <= previewLimit
+      ? skus.join(', ')
+      : `${skus.slice(0, previewLimit).join(', ')} … +${skus.length - previewLimit} more`;
+  const noun = skus.length === 1 ? 'product' : `${skus.length} products`;
+  if (!confirm(`Delete ${noun} from catalog?\n\nSKUs: ${preview}\n\nThis cannot be undone.`)) {
+    return;
+  }
+
+  const submitBtn = form.querySelector('button[type="submit"]');
+  const prev = submitBtn?.textContent;
+  try {
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Deleting...';
+    }
+    await deleteProductsFromACO(skus);
+    showSuccessMessage(skus.length === 1 ? `Product ${skus[0]} deleted.` : `Deleted ${skus.length} products.`);
+    closeDeleteBySkuModal();
+    state.currentPage = 1;
+    await loadProducts();
+  } catch (error) {
+    alert(error?.message || String(error));
+  } finally {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = prev || 'Delete';
+    }
+  }
+}
+
+function createDeleteBySkuModal() {
+  const modal = document.createElement('div');
+  modal.id = 'delete-by-sku-modal';
+  modal.className = 'plp-modal';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'plp-modal-overlay';
+  overlay.addEventListener('click', closeDeleteBySkuModal);
+
+  const dialog = document.createElement('div');
+  dialog.className = 'plp-modal-dialog plp-modal-dialog-small';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-labelledby', 'delete-by-sku-modal-title');
+
+  const header = document.createElement('div');
+  header.className = 'plp-modal-header';
+
+  const title = document.createElement('h2');
+  title.id = 'delete-by-sku-modal-title';
+  title.className = 'plp-modal-title';
+  title.textContent = 'Delete products by SKU';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.className = 'plp-modal-close';
+  closeBtn.setAttribute('aria-label', 'Close modal');
+  closeBtn.appendChild(createIcon('close'));
+  closeBtn.addEventListener('click', closeDeleteBySkuModal);
+
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+
+  const body = document.createElement('div');
+  body.className = 'plp-modal-body';
+
+  const help = document.createElement('p');
+  help.className = 'plp-form-help';
+  help.textContent =
+    `Enter one SKU or a comma-separated list (newlines also OK). Same Data Ingestion API and auth as Paste Product Grid. Locale ${DEFAULT_LOCALE}.`;
+
+  const form = document.createElement('form');
+  form.className = 'plp-modal-form';
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    await handleDeleteBySkuFormSubmit(form);
+  });
+
+  const group = document.createElement('div');
+  group.className = 'plp-form-group';
+
+  const lab = document.createElement('label');
+  lab.className = 'plp-form-label';
+  lab.setAttribute('for', 'delete-by-sku-input');
+  lab.textContent = 'SKU(s)';
+
+  const skuInput = document.createElement('textarea');
+  skuInput.id = 'delete-by-sku-input';
+  skuInput.className = 'plp-form-textarea';
+  skuInput.rows = 4;
+  skuInput.spellcheck = false;
+  skuInput.autocomplete = 'off';
+  skuInput.placeholder = 'e.g. prod6283422, sku-two, sku-three';
+
+  group.appendChild(lab);
+  group.appendChild(skuInput);
+  form.appendChild(group);
+
+  const footer = document.createElement('div');
+  footer.className = 'plp-modal-footer';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'plp-button plp-modal-cancel';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', closeDeleteBySkuModal);
+
+  const deleteBtn = document.createElement('button');
+  deleteBtn.type = 'submit';
+  deleteBtn.className = 'plp-button plp-button-danger';
+  deleteBtn.textContent = 'Delete';
+
+  footer.appendChild(cancelBtn);
+  footer.appendChild(deleteBtn);
+  form.appendChild(footer);
+
+  body.appendChild(help);
+  body.appendChild(form);
+
+  dialog.appendChild(header);
+  dialog.appendChild(body);
+
+  modal.appendChild(overlay);
+  modal.appendChild(dialog);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal.classList.contains('is-open')) {
+      closeDeleteBySkuModal();
+    }
+  });
+
+  return modal;
 }
 
 /**
@@ -1002,14 +3232,14 @@ function updateEditSubmitButton(isLoading) {
 function createPasteModal() {
   const modal = document.createElement('div');
   modal.id = 'paste-product-modal';
-  modal.className = 'plp-modal';
+  modal.className = 'plp-modal plp-modal-paste-fullpage';
 
   const overlay = document.createElement('div');
   overlay.className = 'plp-modal-overlay';
   overlay.addEventListener('click', closePasteModal);
 
   const dialog = document.createElement('div');
-  dialog.className = 'plp-modal-dialog plp-modal-dialog-xlarge';
+  dialog.className = 'plp-modal-dialog plp-modal-dialog-paste-fullpage';
   dialog.setAttribute('role', 'dialog');
   dialog.setAttribute('aria-modal', 'true');
   dialog.setAttribute('aria-labelledby', 'paste-modal-title');
@@ -1021,7 +3251,7 @@ function createPasteModal() {
   const title = document.createElement('h2');
   title.id = 'paste-modal-title';
   title.className = 'plp-modal-title';
-  title.textContent = 'Paste a Product';
+  title.textContent = 'Paste a Product Grid';
 
   const closeBtn = document.createElement('button');
   closeBtn.className = 'plp-modal-close';
@@ -1034,23 +3264,21 @@ function createPasteModal() {
 
   // Body
   const body = document.createElement('div');
-  body.className = 'plp-modal-body';
+  body.className = 'plp-modal-body plp-paste-modal-body';
 
   // Form
   const form = document.createElement('form');
-  form.className = 'plp-modal-form';
+  form.className = 'plp-modal-form plp-paste-modal-form';
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    await handlePasteSubmit(form);
+    await handlePasteSubmit();
   });
 
-  // Two-column layout container
-  const columnsContainer = document.createElement('div');
-  columnsContainer.className = 'plp-paste-columns';
+  const stack = document.createElement('div');
+  stack.className = 'plp-paste-modal-stack';
 
-  // Left column - HTML textarea
-  const leftColumn = document.createElement('div');
-  leftColumn.className = 'plp-paste-column plp-paste-column-left';
+  const sourceSection = document.createElement('div');
+  sourceSection.className = 'plp-paste-modal-source';
 
   const pasteGroup = document.createElement('div');
   pasteGroup.className = 'plp-form-group';
@@ -1058,199 +3286,128 @@ function createPasteModal() {
   const pasteLabel = document.createElement('label');
   pasteLabel.className = 'plp-form-label';
   pasteLabel.setAttribute('for', 'paste-html');
-  pasteLabel.textContent = 'Paste HTML';
+  pasteLabel.textContent = 'Paste JSON or HTML';
 
   const pasteHelp = document.createElement('p');
   pasteHelp.className = 'plp-form-help';
-  pasteHelp.textContent = 'Paste the HTML content for the product below.';
+  pasteHelp.textContent =
+    'Paste the same FeedProduct JSON array as aco-sample-catalog-data-ingestion data/products.json, or HTML. Parse fills columns below.';
 
   const pasteTextarea = document.createElement('textarea');
   pasteTextarea.id = 'paste-html';
-  pasteTextarea.className = 'plp-form-input plp-form-textarea plp-form-textarea-large';
-  pasteTextarea.placeholder = '<div class="product">\n  <h1>Product Name</h1>\n  <span class="sku">SKU-123</span>\n  <p class="description">...</p>\n  <span class="price">$99.99</span>\n  <img src="https://..." />\n</div>';
-  pasteTextarea.rows = 18;
+  pasteTextarea.className = 'plp-form-input plp-form-textarea plp-form-textarea-large plp-paste-modal-textarea';
+  pasteTextarea.placeholder =
+    'Paste objects like data/products.json from aco-sample-catalog-data-ingestion (array of FeedProduct JSON). '
+    + 'Prices often live in a separate file — set Price per row; price book id comes from Commerce settings PRICE_BOOK_ID (that book must exist—use Create price book in settings if needed).\n\n'
+    + 'Or paste HTML with repeated product cards / rows.';
+  pasteTextarea.rows = 14;
 
   pasteGroup.appendChild(pasteLabel);
   pasteGroup.appendChild(pasteHelp);
   pasteGroup.appendChild(pasteTextarea);
-  leftColumn.appendChild(pasteGroup);
+  sourceSection.appendChild(pasteGroup);
 
-  // Parse button
+  const parseRow = document.createElement('div');
+  parseRow.className = 'plp-paste-parse-row';
+  const collapseBtn = document.createElement('button');
+  collapseBtn.type = 'button';
+  collapseBtn.id = 'paste-source-toggle';
+  collapseBtn.className = 'plp-button plp-button-secondary';
+  collapseBtn.textContent = 'Collapse paste box';
+  collapseBtn.addEventListener('click', togglePasteSourceSection);
+  parseRow.appendChild(collapseBtn);
   const parseBtn = document.createElement('button');
   parseBtn.type = 'button';
-  parseBtn.className = 'plp-button plp-button-secondary plp-parse-btn';
-  parseBtn.textContent = 'Parse HTML →';
+  parseBtn.id = 'paste-grid-parse';
+  parseBtn.className = 'plp-button plp-button-secondary';
+  parseBtn.textContent = 'Parse Grid →';
   parseBtn.addEventListener('click', handleParseHtml);
-  leftColumn.appendChild(parseBtn);
+  parseRow.appendChild(parseBtn);
+  sourceSection.appendChild(parseRow);
 
-  // Right column - Form inputs
-  const rightColumn = document.createElement('div');
-  rightColumn.className = 'plp-paste-column plp-paste-column-right';
+  stack.appendChild(sourceSection);
+
+  const tableSection = document.createElement('div');
+  tableSection.className = 'plp-paste-modal-table-section';
 
   const fieldsTitle = document.createElement('h3');
   fieldsTitle.className = 'plp-form-section-title';
-  fieldsTitle.textContent = 'Product Details';
-  rightColumn.appendChild(fieldsTitle);
+  fieldsTitle.textContent = 'Products';
 
-  // SKU field
-  const skuGroup = document.createElement('div');
-  skuGroup.className = 'plp-form-group';
-  const skuLabel = document.createElement('label');
-  skuLabel.className = 'plp-form-label';
-  skuLabel.setAttribute('for', 'paste-sku');
-  skuLabel.textContent = 'SKU *';
-  const skuInput = document.createElement('input');
-  skuInput.type = 'text';
-  skuInput.id = 'paste-sku';
-  skuInput.className = 'plp-form-input';
-  skuInput.placeholder = 'e.g., PROD-001';
-  skuInput.required = true;
-  skuGroup.appendChild(skuLabel);
-  skuGroup.appendChild(skuInput);
-  rightColumn.appendChild(skuGroup);
+  const tableHelp = document.createElement('p');
+  tableHelp.className = 'plp-form-help';
+  tableHelp.textContent =
+    'Columns mirror ingestion JSON (sku, source.locale, slug, status, descriptions, visibleIn, metaTags, attributes[], images[], links[], routes[]) plus price. Price book on upload is always PRICE_BOOK_ID from Commerce settings—that id must exist in the catalog (Commerce settings → Create price book, Admin, or other ingestion). Edit cells, then Add Products. Use Submit prices to POST the same array as View prices.json (products/prices ingestion) without re-uploading products.';
 
-  // Product Name field
-  const nameGroup = document.createElement('div');
-  nameGroup.className = 'plp-form-group';
-  const nameLabel = document.createElement('label');
-  nameLabel.className = 'plp-form-label';
-  nameLabel.setAttribute('for', 'paste-name');
-  nameLabel.textContent = 'Product Name *';
-  const nameInput = document.createElement('input');
-  nameInput.type = 'text';
-  nameInput.id = 'paste-name';
-  nameInput.className = 'plp-form-input';
-  nameInput.placeholder = 'Enter product name';
-  nameInput.required = true;
-  nameGroup.appendChild(nameLabel);
-  nameGroup.appendChild(nameInput);
-  rightColumn.appendChild(nameGroup);
+  const gridWrap = document.createElement('div');
+  gridWrap.className = 'plp-paste-grid-wrap';
 
-  // Description field
-  const descGroup = document.createElement('div');
-  descGroup.className = 'plp-form-group';
-  const descLabel = document.createElement('label');
-  descLabel.className = 'plp-form-label';
-  descLabel.setAttribute('for', 'paste-description');
-  descLabel.textContent = 'Description';
-  const descTextarea = document.createElement('textarea');
-  descTextarea.id = 'paste-description';
-  descTextarea.className = 'plp-form-input plp-form-textarea';
-  descTextarea.placeholder = 'Product description';
-  descTextarea.rows = 4;
-  descGroup.appendChild(descLabel);
-  descGroup.appendChild(descTextarea);
-  rightColumn.appendChild(descGroup);
+  const table = document.createElement('table');
+  table.className = 'plp-paste-grid-table';
+  table.setAttribute('role', 'grid');
 
-  // Price field
-  const priceGroup = document.createElement('div');
-  priceGroup.className = 'plp-form-group';
-  const priceLabel = document.createElement('label');
-  priceLabel.className = 'plp-form-label';
-  priceLabel.setAttribute('for', 'paste-price');
-  priceLabel.textContent = 'Price (USD)';
-  const priceInput = document.createElement('input');
-  priceInput.type = 'number';
-  priceInput.id = 'paste-price';
-  priceInput.className = 'plp-form-input';
-  priceInput.placeholder = '0.00';
-  priceInput.step = '0.01';
-  priceGroup.appendChild(priceLabel);
-  priceGroup.appendChild(priceInput);
-  rightColumn.appendChild(priceGroup);
+  const thead = document.createElement('thead');
+  const headerRow = document.createElement('tr');
+  PASTE_GRID_COLUMNS.forEach(({ header }) => {
+    const th = document.createElement('th');
+    th.textContent = header;
+    headerRow.appendChild(th);
+  });
+  const actionsTh = document.createElement('th');
+  actionsTh.className = 'plp-paste-grid-actions-header';
+  actionsTh.textContent = '';
+  headerRow.appendChild(actionsTh);
+  thead.appendChild(headerRow);
+  table.appendChild(thead);
 
-  // Image URL field
-  const imageGroup = document.createElement('div');
-  imageGroup.className = 'plp-form-group';
-  const imageLabel = document.createElement('label');
-  imageLabel.className = 'plp-form-label';
-  imageLabel.setAttribute('for', 'paste-image');
-  imageLabel.textContent = 'Image URL';
-  const imageInput = document.createElement('input');
-  imageInput.type = 'url';
-  imageInput.id = 'paste-image';
-  imageInput.className = 'plp-form-input';
-  imageInput.placeholder = 'https://example.com/image.jpg';
-  imageGroup.appendChild(imageLabel);
-  imageGroup.appendChild(imageInput);
-  rightColumn.appendChild(imageGroup);
+  const tbody = document.createElement('tbody');
+  tbody.id = 'paste-grid-tbody';
+  table.appendChild(tbody);
 
-  // Visibility checkboxes
-  const visibilityGroup = document.createElement('div');
-  visibilityGroup.className = 'plp-form-group';
-  const visibilityLabel = document.createElement('label');
-  visibilityLabel.className = 'plp-form-label';
-  visibilityLabel.textContent = 'Visibility';
-  visibilityGroup.appendChild(visibilityLabel);
+  gridWrap.appendChild(table);
+  tableSection.appendChild(fieldsTitle);
+  tableSection.appendChild(tableHelp);
+  tableSection.appendChild(gridWrap);
 
-  const checkboxContainer = document.createElement('div');
-  checkboxContainer.className = 'plp-checkbox-group';
+  stack.appendChild(tableSection);
 
-  // Catalog checkbox
-  const catalogLabel = document.createElement('label');
-  catalogLabel.className = 'plp-checkbox-label';
-  const catalogCheckbox = document.createElement('input');
-  catalogCheckbox.type = 'checkbox';
-  catalogCheckbox.name = 'paste-visible-in';
-  catalogCheckbox.id = 'paste-visible-catalog';
-  catalogCheckbox.value = 'CATALOG';
-  catalogCheckbox.checked = true;
-  catalogLabel.appendChild(catalogCheckbox);
-  catalogLabel.appendChild(document.createTextNode(' Catalog'));
-  checkboxContainer.appendChild(catalogLabel);
-
-  // Search checkbox
-  const searchLabel = document.createElement('label');
-  searchLabel.className = 'plp-checkbox-label';
-  const searchCheckbox = document.createElement('input');
-  searchCheckbox.type = 'checkbox';
-  searchCheckbox.name = 'paste-visible-in';
-  searchCheckbox.id = 'paste-visible-search';
-  searchCheckbox.value = 'SEARCH';
-  searchCheckbox.checked = true;
-  searchLabel.appendChild(searchCheckbox);
-  searchLabel.appendChild(document.createTextNode(' Search'));
-  checkboxContainer.appendChild(searchLabel);
-
-  visibilityGroup.appendChild(checkboxContainer);
-  rightColumn.appendChild(visibilityGroup);
-
-  // Attributes section
-  const attributesSection = createFormSection('Attributes');
-  const attributesList = createDynamicListSection('paste-product-attributes', '', [
-    { name: 'code', placeholder: 'Attribute code (e.g., brand)', type: 'text' },
-    {
-      name: 'type',
-      placeholder: 'Type',
-      type: 'select',
-      options: [
-        { value: 'STRING', label: 'String' },
-        { value: 'NUMBER', label: 'Number' },
-        { value: 'BOOLEAN', label: 'Boolean' },
-      ],
-    },
-    { name: 'value', placeholder: 'Value', type: 'text' },
-  ], 'Add Attribute');
-  attributesSection.appendChild(attributesList);
-  rightColumn.appendChild(attributesSection);
-
-  // Meta Tags section
-  const metaTagsSection = createFormSection('SEO / Meta Tags');
-  const metaTitleGroup = createFormGroup('paste-meta-title', 'Meta Title', 'text', 'SEO title for search engines');
-  const metaDescGroup = createFormGroup('paste-meta-description', 'Meta Description', 'text', 'SEO description for search engines');
-  const metaKeywordsGroup = createFormGroup('paste-meta-keywords', 'Meta Keywords', 'text', 'keyword1, keyword2, keyword3 (comma separated)');
-  metaTagsSection.appendChild(metaTitleGroup);
-  metaTagsSection.appendChild(metaDescGroup);
-  metaTagsSection.appendChild(metaKeywordsGroup);
-  rightColumn.appendChild(metaTagsSection);
-
-  columnsContainer.appendChild(leftColumn);
-  columnsContainer.appendChild(rightColumn);
-  form.appendChild(columnsContainer);
+  form.appendChild(stack);
 
   // Footer
   const footer = document.createElement('div');
-  footer.className = 'plp-modal-footer';
+  footer.className = 'plp-modal-footer plp-paste-modal-footer';
+
+  const footerLeft = document.createElement('div');
+  footerLeft.className = 'plp-modal-footer-group';
+
+  const viewProductsBtn = document.createElement('button');
+  viewProductsBtn.type = 'button';
+  viewProductsBtn.className = 'plp-button plp-button-secondary';
+  viewProductsBtn.textContent = 'View products.json';
+  viewProductsBtn.addEventListener('click', () => openIngestionJsonPreview('products'));
+
+  const viewPricesBtn = document.createElement('button');
+  viewPricesBtn.type = 'button';
+  viewPricesBtn.className = 'plp-button plp-button-secondary';
+  viewPricesBtn.textContent = 'View prices.json';
+  viewPricesBtn.addEventListener('click', () => openIngestionJsonPreview('prices'));
+
+  const submitPricesBtn = document.createElement('button');
+  submitPricesBtn.type = 'button';
+  submitPricesBtn.className = 'plp-button plp-button-secondary plp-paste-submit-prices-btn';
+  submitPricesBtn.textContent = 'Submit prices';
+  submitPricesBtn.title =
+    'POST …/v1/catalog/products/prices with the current grid’s price rows (same JSON as View prices.json). PRICE_BOOK_ID must already exist. Does not create or update products.';
+  submitPricesBtn.addEventListener('click', () => {
+    handlePasteModalSubmitPricesFromGrid();
+  });
+
+  footerLeft.appendChild(viewProductsBtn);
+  footerLeft.appendChild(viewPricesBtn);
+  footerLeft.appendChild(submitPricesBtn);
+
+  const footerRight = document.createElement('div');
+  footerRight.className = 'plp-modal-footer-group';
 
   const cancelBtn = document.createElement('button');
   cancelBtn.type = 'button';
@@ -1261,111 +3418,13 @@ function createPasteModal() {
   const submitBtn = document.createElement('button');
   submitBtn.type = 'submit';
   submitBtn.className = 'plp-button';
-  submitBtn.textContent = 'Add Product';
+  submitBtn.textContent = 'Add Products';
 
-  footer.appendChild(cancelBtn);
-  footer.appendChild(submitBtn);
+  footerRight.appendChild(cancelBtn);
+  footerRight.appendChild(submitBtn);
 
-  form.appendChild(footer);
-  body.appendChild(form);
-
-  dialog.appendChild(header);
-  dialog.appendChild(body);
-
-  modal.appendChild(overlay);
-  modal.appendChild(dialog);
-
-  return modal;
-}
-
-function createTokenModal() {
-  const modal = document.createElement('div');
-  modal.id = 'token-modal';
-  modal.className = 'plp-modal';
-
-  const overlay = document.createElement('div');
-  overlay.className = 'plp-modal-overlay';
-  overlay.addEventListener('click', closeTokenModal);
-
-  const dialog = document.createElement('div');
-  dialog.className = 'plp-modal-dialog plp-modal-dialog-small';
-  dialog.setAttribute('role', 'dialog');
-  dialog.setAttribute('aria-modal', 'true');
-  dialog.setAttribute('aria-labelledby', 'token-modal-title');
-
-  // Header
-  const header = document.createElement('div');
-  header.className = 'plp-modal-header';
-
-  const title = document.createElement('h2');
-  title.id = 'token-modal-title';
-  title.className = 'plp-modal-title';
-  title.textContent = 'Enter Bearer Token';
-
-  const closeBtn = document.createElement('button');
-  closeBtn.className = 'plp-modal-close';
-  closeBtn.setAttribute('aria-label', 'Close modal');
-  closeBtn.appendChild(createIcon('close'));
-  closeBtn.addEventListener('click', closeTokenModal);
-
-  header.appendChild(title);
-  header.appendChild(closeBtn);
-
-  // Body
-  const body = document.createElement('div');
-  body.className = 'plp-modal-body';
-
-  // Form
-  const form = document.createElement('form');
-  form.className = 'plp-modal-form';
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    await handleTokenSubmit(form);
-  });
-
-  // Token field
-  const tokenGroup = document.createElement('div');
-  tokenGroup.className = 'plp-form-group';
-
-  const tokenLabel = document.createElement('label');
-  tokenLabel.className = 'plp-form-label';
-  tokenLabel.setAttribute('for', 'bearer-token');
-  tokenLabel.textContent = 'Bearer Token';
-
-  const tokenHelp = document.createElement('p');
-  tokenHelp.className = 'plp-form-help';
-  tokenHelp.textContent = 'Paste your Adobe IMS access token below. The "Bearer " prefix is optional.';
-
-  const tokenInput = document.createElement('textarea');
-  tokenInput.id = 'bearer-token';
-  tokenInput.className = 'plp-form-input plp-form-textarea';
-  tokenInput.placeholder = 'eyJhbGciOiJSUzI1NiIsIng1dSI6...';
-  tokenInput.required = true;
-  tokenInput.rows = 6;
-
-  tokenGroup.appendChild(tokenLabel);
-  tokenGroup.appendChild(tokenHelp);
-  tokenGroup.appendChild(tokenInput);
-
-  form.appendChild(tokenGroup);
-
-  // Footer
-  const footer = document.createElement('div');
-  footer.className = 'plp-modal-footer';
-
-  const cancelBtn = document.createElement('button');
-  cancelBtn.type = 'button';
-  cancelBtn.className = 'plp-button plp-button-secondary';
-  cancelBtn.textContent = 'Cancel';
-  cancelBtn.addEventListener('click', closeTokenModal);
-
-  const submitBtn = document.createElement('button');
-  submitBtn.type = 'submit';
-  submitBtn.className = 'plp-button';
-  submitBtn.textContent = 'Save Token';
-
-  footer.appendChild(cancelBtn);
-  footer.appendChild(submitBtn);
+  footer.appendChild(footerLeft);
+  footer.appendChild(footerRight);
 
   form.appendChild(footer);
   body.appendChild(form);
@@ -1553,15 +3612,24 @@ function createEditModal() {
  * See: https://github.com/adobe-commerce/aco-sample-catalog-data-ingestion
  */
 function buildProductPayload(formData) {
-  // Generate slug from name if not provided
-  const slug = formData.slug
-    || formData.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+  const slugInput = typeof formData.slug === 'string' ? formData.slug.trim() : '';
+  const slug =
+    slugInput ||
+    formData.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+  const locale =
+    formData.locale != null && String(formData.locale).trim()
+      ? String(formData.locale).trim()
+      : DEFAULT_LOCALE;
+
+  const description = String(formData.description ?? '').trim();
+  const shortDescriptionRaw = String(formData.shortDescription ?? '').trim();
+  const shortDescription = shortDescriptionRaw || description;
 
   const payload = {
     // Required fields
     sku: formData.sku,
     source: {
-      locale: DEFAULT_LOCALE,
+      locale,
     },
     name: formData.name,
     slug,
@@ -1569,7 +3637,7 @@ function buildProductPayload(formData) {
 
     // Optional fields
     description: formData.description || '',
-    shortDescription: formData.shortDescription || '',
+    shortDescription,
   };
 
   // Visibility
@@ -1587,13 +3655,10 @@ function buildProductPayload(formData) {
     }
   }
 
-  // Attributes
-  if (formData.attributes && formData.attributes.length > 0) {
-    payload.attributes = formData.attributes.map((attr) => ({
-      code: attr.code,
-      type: attr.type,
-      values: [attr.value],
-    }));
+  // Attributes: { code, type, values } (aligned with aco-sample-catalog-data-ingestion products.json)
+  const normalizedAttrs = normalizeAttributesForIngestion(formData.attributes);
+  if (normalizedAttrs.length > 0) {
+    payload.attributes = normalizedAttrs;
   }
 
   // Images
@@ -1601,7 +3666,14 @@ function buildProductPayload(formData) {
     payload.images = formData.images.map((img) => ({
       url: img.url,
       label: img.label || formData.name,
-      roles: img.roles ? img.roles.split(',').map((r) => r.trim().toUpperCase()).filter((r) => r) : ['THUMBNAIL', 'BASE', 'SMALL'],
+      roles: Array.isArray(img.roles)
+        ? img.roles.map((r) => String(r).trim().toUpperCase()).filter(Boolean)
+        : img.roles
+          ? String(img.roles)
+              .split(',')
+              .map((r) => r.trim().toUpperCase())
+              .filter(Boolean)
+          : ['THUMBNAIL', 'BASE', 'SMALL'],
     }));
   }
 
@@ -1637,32 +3709,49 @@ function buildPricePayload(sku, price, priceBookId) {
 
 /**
  * Submit product to ACO Catalog Ingestion API
- * Uses direct REST API calls with the access token from DA SDK
+ * Uses direct REST calls with an IMS bearer that includes commerce.aco.ingestion when using client credentials.
  *
  * API Reference:
- * POST https://na1-sandbox.api.commerce.adobe.com/{{tenantId}}/v1/feeds/products
- * POST https://na1-sandbox.api.commerce.adobe.com/{{tenantId}}/v1/feeds/prices
+ * POST …/{{tenantId}}/v1/catalog/products
+ * POST …/{{tenantId}}/v1/catalog/products/prices
  */
-async function submitProductToACO(productPayload, pricePayload) {
-  // Ensure we have an access token
-  await ensureAccessToken();
-
-  if (!accessToken) {
-    throw new Error('No access token available. Please ensure you are authenticated.');
-  }
-
-  console.log('Using access token for submit:', accessToken.substring(0, 50) + '...');
+async function submitPricesBatchToACO(pricePayloads) {
+  const bearer = await getBearerForCatalogWrite();
 
   const headers = {
     'Content-Type': 'application/json',
-    Authorization: `Bearer ${accessToken}`,
+    Authorization: `Bearer ${bearer}`,
+  };
+
+  const response = await fetch(acoRuntime.pricesEndpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(pricePayloads),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to create prices: ${response.status} - ${errorText}`);
+  }
+
+  return response.json();
+}
+
+async function submitProductToACO(productPayload, pricePayload) {
+  const bearer = await getBearerForCatalogWrite();
+
+  console.log('Using access token for submit:', bearer.substring(0, 50) + '...');
+
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${bearer}`,
   };
 
   try {
     // Step 1: Create the product
     console.log('Creating product in ACO...', productPayload);
 
-    const productResponse = await fetch(ACO_PRODUCTS_ENDPOINT, {
+    const productResponse = await fetch(acoRuntime.productsEndpoint, {
       method: 'POST',
       headers,
       body: JSON.stringify([productPayload]), // API expects an array of products
@@ -1680,7 +3769,7 @@ async function submitProductToACO(productPayload, pricePayload) {
     // Step 2: Create the price
     console.log('Creating price in ACO...', pricePayload);
 
-    const priceResponse = await fetch(ACO_PRICES_ENDPOINT, {
+    const priceResponse = await fetch(acoRuntime.pricesEndpoint, {
       method: 'POST',
       headers,
       body: JSON.stringify([pricePayload]), // API expects an array of prices
@@ -1789,7 +3878,7 @@ async function handleProductSubmit(form) {
 
   // Build payloads
   const productPayload = buildProductPayload(formData);
-  const pricePayload = buildPricePayload(formData.sku, formData.price, DEFAULT_PRICE_BOOK);
+  const pricePayload = buildPricePayload(formData.sku, formData.price, getDefaultPriceBook());
 
   console.log('Product Payload (ACO FeedProduct format):', productPayload);
   console.log('Price Payload (ACO FeedPrices format):', pricePayload);
@@ -1803,8 +3892,12 @@ async function handleProductSubmit(form) {
     const result = await submitProductToACO(productPayload, pricePayload);
     console.log('Product created successfully:', result);
 
-    // Success - close modal and refresh products
     closeModal();
+    openApiResponseModal({
+      title: 'Add product — API response',
+      subtitle: `Success · SKU ${formData.sku}`,
+      bodyText: JSON.stringify(result, null, 2),
+    });
     showSuccessMessage(`Product "${formData.name}" added successfully!`);
 
     // Refresh product list (note: ingestion is async, may take time to appear)
@@ -1812,7 +3905,13 @@ async function handleProductSubmit(form) {
     await loadProducts();
   } catch (error) {
     console.error('Failed to create product:', error);
-    showFormError(`Failed to create product: ${error.message}`);
+    const detail =
+      `${error?.message || String(error)}${error?.cause ? `\n\ncause: ${error.cause}` : ''}`;
+    openApiResponseModal({
+      title: 'Add product — API error',
+      subtitle: `Failed · SKU ${formData.sku}`,
+      bodyText: detail,
+    });
   } finally {
     modalState.isSubmitting = false;
     updateSubmitButton(false);
@@ -2236,6 +4335,20 @@ function createFormGroup(id, labelText, inputType, placeholder, required = false
   return group;
 }
 
+function refreshPriceBookFilterSelect() {
+  const sel = document.querySelector('select.plp-pricebook-select');
+  if (!sel) return;
+  const opts = getPriceBookOptionsForFilter().map((pb) => ({ value: pb, label: pb }));
+  sel.innerHTML = '';
+  opts.forEach(({ value, label }) => {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = label;
+    o.selected = value === state.selectedPriceBook;
+    sel.appendChild(o);
+  });
+}
+
 function createSelect(options, selectedValue, onChange, className = '') {
   const select = document.createElement('select');
   select.className = `plp-select ${className}`;
@@ -2384,7 +4497,7 @@ function createProductCard(product) {
   if (showDiscount(product.price, product.globalPrice)) {
     const originalPrice = document.createElement('span');
     originalPrice.className = 'plp-original-price';
-    originalPrice.textContent = product.globalPrice && state.selectedPriceBook !== 'global'
+    originalPrice.textContent = product.globalPrice && state.selectedPriceBook !== getDefaultPriceBook()
       ? formatPrice(product.globalPrice.final)
       : formatPrice(product.price?.regular);
     priceInfo.appendChild(originalPrice);
@@ -2510,36 +4623,68 @@ function renderHeader(container) {
   const headerButtons = document.createElement('div');
   headerButtons.className = 'plp-header-buttons';
 
-  // Enter Token button
-  const tokenBtn = document.createElement('button');
-  tokenBtn.className = 'plp-button plp-button-secondary plp-token-btn';
-  tokenBtn.appendChild(createIcon('key'));
-  const tokenBtnText = document.createElement('span');
-  tokenBtnText.textContent = 'Enter a Token';
-  tokenBtn.appendChild(tokenBtnText);
-  tokenBtn.addEventListener('click', openTokenModal);
+  const settingsBtn = document.createElement('button');
+  settingsBtn.className = 'plp-button plp-button-secondary plp-settings-btn';
+  settingsBtn.appendChild(createIcon('settings'));
+  const settingsBtnText = document.createElement('span');
+  settingsBtnText.textContent = 'Commerce settings';
+  settingsBtn.appendChild(settingsBtnText);
+  settingsBtn.addEventListener('click', openAcoSettingsModal);
 
-  // Paste a Product button
+  // Paste Product Grid button
   const pasteBtn = document.createElement('button');
   pasteBtn.className = 'plp-button plp-button-secondary';
   pasteBtn.appendChild(createIcon('clipboard'));
   const pasteBtnText = document.createElement('span');
-  pasteBtnText.textContent = 'Paste a Product';
+  pasteBtnText.textContent = 'Paste Product Grid';
   pasteBtn.appendChild(pasteBtnText);
   pasteBtn.addEventListener('click', openPasteModal);
 
-  // Add New Product button
-  const addProductBtn = document.createElement('button');
-  addProductBtn.className = 'plp-button plp-add-product-btn';
-  addProductBtn.appendChild(createIcon('plus'));
-  const btnText = document.createElement('span');
-  btnText.textContent = 'Add New Product';
-  addProductBtn.appendChild(btnText);
-  addProductBtn.addEventListener('click', openModal);
+  const viewProductsJsonBtn = document.createElement('button');
+  viewProductsJsonBtn.type = 'button';
+  viewProductsJsonBtn.className = 'plp-button plp-button-secondary';
+  viewProductsJsonBtn.textContent = 'View products.json';
+  viewProductsJsonBtn.title = 'Preview FeedProduct array from the Paste Product Grid table';
+  viewProductsJsonBtn.addEventListener('click', () => openIngestionJsonPreview('products'));
 
-  headerButtons.appendChild(tokenBtn);
+  const viewPricesJsonBtn = document.createElement('button');
+  viewPricesJsonBtn.type = 'button';
+  viewPricesJsonBtn.className = 'plp-button plp-button-secondary';
+  viewPricesJsonBtn.textContent = 'View prices.json';
+  viewPricesJsonBtn.title = 'Preview price rows from the Paste Product Grid table';
+  viewPricesJsonBtn.addEventListener('click', () => openIngestionJsonPreview('prices'));
+
+  const deleteBySkuBtn = document.createElement('button');
+  deleteBySkuBtn.type = 'button';
+  deleteBySkuBtn.className = 'plp-button plp-button-secondary';
+  deleteBySkuBtn.appendChild(createIcon('trash'));
+  const deleteBySkuBtnText = document.createElement('span');
+  deleteBySkuBtnText.textContent = 'Delete by SKU';
+  deleteBySkuBtn.appendChild(deleteBySkuBtnText);
+  deleteBySkuBtn.title =
+    'Delete one or more products by SKU (comma-separated list) via catalog ingestion (no search required)';
+  deleteBySkuBtn.addEventListener('click', openDeleteBySkuModal);
+
+  const clearStorageBtn = document.createElement('button');
+  clearStorageBtn.type = 'button';
+  clearStorageBtn.className = 'plp-button plp-button-danger';
+  clearStorageBtn.textContent = 'Clear app storage';
+  clearStorageBtn.title =
+    'Remove CLIENT_ID, CLIENT_SECRET, INGESTION_ACCESS_TOKEN, token expiry, TENANT_ID, REGION, ENVIRONMENT, CATALOG_VIEW_ID, PRICE_BOOK_ID, PRICE_BOOK_NAME, and PRICE_BOOK_CURRENCY for this tool only';
+  clearStorageBtn.addEventListener('click', async () => {
+    try {
+      await handleClearAppLocalStorage();
+    } catch (err) {
+      alert(err?.message || String(err));
+    }
+  });
+
+  headerButtons.appendChild(settingsBtn);
   headerButtons.appendChild(pasteBtn);
-  headerButtons.appendChild(addProductBtn);
+  headerButtons.appendChild(viewProductsJsonBtn);
+  headerButtons.appendChild(viewPricesJsonBtn);
+  headerButtons.appendChild(deleteBySkuBtn);
+  headerButtons.appendChild(clearStorageBtn);
 
   headerTop.appendChild(headerText);
   headerTop.appendChild(headerButtons);
@@ -2591,9 +4736,9 @@ function renderHeader(container) {
   }, 'plp-sort-select');
 
   // Price book filter
-  const priceBookOptions = ALL_PRICE_BOOKS.map((pb) => ({
+  const priceBookOptions = getPriceBookOptionsForFilter().map((pb) => ({
     value: pb,
-    label: pb === 'global' ? 'Global Price Book' : 'VIP Price Book',
+    label: pb,
   }));
   const priceBookSelect = createSelect(priceBookOptions, state.selectedPriceBook, (value) => {
     state.selectedPriceBook = value;
@@ -2668,12 +4813,26 @@ function renderLoadMore(container) {
 
 // Data functions
 async function loadProducts(append = false) {
+  if (!hasAnyCommerceLocalStorage()) {
+    state.isLoading = false;
+    if (!append) {
+      state.products = [];
+      state.totalCount = 0;
+      state.currentPage = 1;
+      filterAndRenderProducts();
+    }
+    updateLoadingState();
+    const listContainer = document.getElementById('product-list-container');
+    if (listContainer) renderAcoConfigBanner(listContainer);
+    return;
+  }
+
   state.isLoading = true;
   updateLoadingState();
 
   try {
     const result = await searchProducts(
-      CATALOG_VIEW_ID,
+      acoRuntime.catalogViewId,
       DEFAULT_LOCALE,
       state.selectedPriceBook,
       state.searchTerm,
@@ -2776,30 +4935,60 @@ function renderProductListPage(container) {
   container.appendChild(mainContent);
 }
 
+function renderAcoConfigBanner(container) {
+  purgeExpiredIngestionTokenIfNeeded();
+
+  const existing = container.querySelector('.plp-config-banner');
+  if (existing) existing.remove();
+
+  const lines = [];
+  if (!hasAnyCommerceLocalStorage()) {
+    lines.push(
+      'Open Commerce settings (header) and save at least one field—the product catalog loads only after something is saved there.',
+    );
+  }
+  if (!accessToken) {
+    lines.push(
+      'Open Commerce settings: use Retrieve bearer token (CLIENT_ID) or paste INGESTION_ACCESS_TOKEN, or sign in with DA (DA token alone does not authorize catalog writes).',
+    );
+  }
+
+  if (lines.length === 0) return;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'plp-config-banner';
+  wrap.setAttribute('role', 'status');
+
+  const title = document.createElement('p');
+  title.className = 'plp-config-banner-title';
+  title.textContent = 'Open Commerce settings';
+
+  const list = document.createElement('ul');
+  list.className = 'plp-config-banner-list';
+  lines.forEach((text) => {
+    const li = document.createElement('li');
+    li.textContent = text;
+    list.appendChild(li);
+  });
+
+  wrap.appendChild(title);
+  wrap.appendChild(list);
+  container.insertBefore(wrap, container.firstChild);
+}
+
 (async function init() {
+  acoRuntime = buildAcoRuntimeConfig();
+  purgeExpiredIngestionTokenIfNeeded();
+
   const { context, token, actions } = await DA_SDK;
   console.log('DA SDK Context:', context);
 
-  // Check sessionStorage for saved token first
-  try {
-    const savedToken = sessionStorage.getItem('aco_access_token');
-    if (savedToken) {
-      accessToken = savedToken;
-      userProvidedToken = true;
-      console.log('Using token from sessionStorage');
-      console.log('Stored access token:', accessToken.substring(0, 50) + '...');
-    }
-  } catch (e) {
-    console.warn('Could not read token from sessionStorage:', e);
-  }
-
-  // If no saved token, try DA SDK or IMS
   if (!accessToken) {
     console.log('DA SDK token provided:', !!token);
     if (token) {
       accessToken = token;
       console.log('Using DA SDK token');
-    } else {
+    } else if (acoRuntime.hasImsClientCredentials) {
       console.log('No DA SDK token, requesting from Adobe IMS...');
       try {
         accessToken = await requestAccessToken();
@@ -2807,9 +4996,43 @@ function renderProductListPage(container) {
       } catch (error) {
         console.error('Failed to get access token:', error);
       }
+    } else {
+      const storedIngestion = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+      if (storedIngestion) {
+        accessToken = storedIngestion;
+        console.log('Using INGESTION_ACCESS_TOKEN from localStorage');
+      } else {
+        console.warn(
+          'No token yet: use Commerce settings (Retrieve bearer token or paste INGESTION_ACCESS_TOKEN) or open with DA.',
+        );
+      }
     }
   }
   console.log('Access token available:', !!accessToken);
+
+  let hydrateResult = { ok: false };
+  try {
+    hydrateResult = await hydrateCommerceSettingsFromQueryParams();
+    if (hydrateResult.ok) {
+      acoRuntime = buildAcoRuntimeConfig();
+      if (!getPriceBookOptionsForFilter().includes(state.selectedPriceBook)) {
+        state.selectedPriceBook = getDefaultPriceBook();
+      }
+      if (acoRuntime.hasImsClientCredentials) {
+        try {
+          accessToken = await requestAccessToken();
+          console.log('Refreshed IMS access token after commerce sheet hydrate');
+        } catch (e) {
+          console.warn('Could not refresh IMS token after sheet hydrate:', e);
+        }
+      } else {
+        const ingAfterHydrate = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+        if (ingAfterHydrate) accessToken = ingAfterHydrate;
+      }
+    }
+  } catch (e) {
+    console.warn('hydrateCommerceSettingsFromQueryParams:', e);
+  }
 
   // Create main container
   const container = document.createElement('div');
@@ -2824,19 +5047,39 @@ function renderProductListPage(container) {
 
   // Initialize and render
   renderProductListPage(container);
+  refreshPriceBookFilterSelect();
+  renderAcoConfigBanner(container);
 
   // Add modals to the page
   const addModal = createModal();
   document.body.appendChild(addModal);
 
-  const tokenModal = createTokenModal();
-  document.body.appendChild(tokenModal);
+  const acoSettingsModal = createAcoSettingsModal();
+  document.body.appendChild(acoSettingsModal);
+
+  if (hydrateResult.ok) {
+    fillAcoSettingsForm(acoSettingsModal.querySelector('form'));
+  }
 
   const pasteModal = createPasteModal();
   document.body.appendChild(pasteModal);
 
+  const ingestionJsonPreviewModal = createIngestionJsonPreviewModal();
+  document.body.appendChild(ingestionJsonPreviewModal);
+
+  const apiResponseModal = createApiResponseModal();
+  document.body.appendChild(apiResponseModal);
+
   const editModal = createEditModal();
   document.body.appendChild(editModal);
 
-  await loadProducts();
+  const deleteBySkuModal = createDeleteBySkuModal();
+  document.body.appendChild(deleteBySkuModal);
+
+  if (!hasAnyCommerceLocalStorage()) {
+    openAcoSettingsModal();
+    await loadProducts();
+  } else {
+    await loadProducts();
+  }
 }());
