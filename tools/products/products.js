@@ -3,6 +3,8 @@ import DA_SDK from 'https://da.live/nx/utils/sdk.js';
 /**
  * Same keys as aco-sample-catalog-data-ingestion `.env`, plus catalog view for GraphQL
  * and optional default price book id for prices/search.
+ * Price-book **ingestion** uses the Data Ingestion REST API directly (equivalent to
+ * `@adobe-commerce/aco-ts-sdk` `createPriceBooks`); the SDK is not bundled in this tool.
  * Values are read from localStorage first; non-secret URL parts fall back to demo defaults.
  */
 const ACO_LS_KEYS = {
@@ -10,11 +12,17 @@ const ACO_LS_KEYS = {
   CLIENT_SECRET: 'CLIENT_SECRET',
   /** Bearer for Data Ingestion only; use when browser cannot call IMS (CORS). From Developer Console → Generate Access Token. */
   INGESTION_ACCESS_TOKEN: 'INGESTION_ACCESS_TOKEN',
+  /** Epoch ms when INGESTION_ACCESS_TOKEN should be treated as expired (set from Fusion expires_in). */
+  INGESTION_ACCESS_TOKEN_EXPIRES_AT: 'INGESTION_ACCESS_TOKEN_EXPIRES_AT',
   TENANT_ID: 'TENANT_ID',
   REGION: 'REGION',
   ENVIRONMENT: 'ENVIRONMENT',
   CATALOG_VIEW_ID: 'CATALOG_VIEW_ID',
   PRICE_BOOK_ID: 'PRICE_BOOK_ID',
+  /** Display name when creating a price book via Data Ingestion (optional; defaults to id). */
+  PRICE_BOOK_NAME: 'PRICE_BOOK_NAME',
+  /** ISO currency for create price book (optional; defaults to USD). */
+  PRICE_BOOK_CURRENCY: 'PRICE_BOOK_CURRENCY',
 };
 
 /** commerce/settings.json row keys (often lowercase snake_case) → localStorage env names */
@@ -22,6 +30,7 @@ const COMMERCE_SETTINGS_JSON_KEYS = {
   client_id: ACO_LS_KEYS.CLIENT_ID,
   client_secret: ACO_LS_KEYS.CLIENT_SECRET,
   ingestion_access_token: ACO_LS_KEYS.INGESTION_ACCESS_TOKEN,
+  ingestion_access_token_expires_at: ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT,
   tenant_id: ACO_LS_KEYS.TENANT_ID,
   tenet_id: ACO_LS_KEYS.TENANT_ID,
   region: ACO_LS_KEYS.REGION,
@@ -29,6 +38,8 @@ const COMMERCE_SETTINGS_JSON_KEYS = {
   environment: ACO_LS_KEYS.ENVIRONMENT,
   catalog_view_id: ACO_LS_KEYS.CATALOG_VIEW_ID,
   price_book_id: ACO_LS_KEYS.PRICE_BOOK_ID,
+  price_book_name: ACO_LS_KEYS.PRICE_BOOK_NAME,
+  price_book_currency: ACO_LS_KEYS.PRICE_BOOK_CURRENCY,
 };
 
 const DEFAULT_TENANT_ID = 'NZwP3wKPFXBCTLGqxYWZne';
@@ -40,13 +51,21 @@ const PAGE_SIZE = 25;
 const DEFAULT_LOCALE = 'en-US';
 /** Fallback when PRICE_BOOK_ID is not set in Commerce settings */
 const DEFAULT_PRICE_BOOK_FALLBACK = 'wknd_global';
+/** Default currency for POST /v1/catalog/price-books (FeedPricebook) when settings field is empty */
+const DEFAULT_PRICE_BOOK_CURRENCY = 'USD';
+/** Same batch size as aco-sample-catalog-data-ingestion `index.js` (createPriceBooks per batch). */
+const PRICE_BOOKS_INGEST_BATCH_SIZE = 100;
 /** Extra ids kept in the catalog filter dropdown alongside your configured default */
 const SAMPLE_PRICE_BOOKS = ['wknd_global', 'wknd_vip'];
+
+/** Fusion hook: POST JSON `{ client_id }` to receive an ingestion bearer (avoids browser CORS to Adobe IMS). */
+const FUSION_INGESTION_TOKEN_HOOK_URL =
+  'https://hook.fusion.adobe.com/wrnqgcbprf11b1jqy9gw9acdt2crjgpj';
 
 /**
  * Paste-grid columns aligned with FeedProduct objects in
  * https://github.com/adobe-commerce/aco-sample-catalog-data-ingestion/blob/main/data/products.json
- * (plus price / priceBookId, which live in separate sample files but are submitted together here).
+ * (plus price; price book for upload comes from Commerce settings PRICE_BOOK_ID).
  */
 const PASTE_GRID_COLUMNS = [
   { field: 'sku', header: 'SKU', placeholder: 'aur-flu-bat-mid-2013' },
@@ -96,7 +115,7 @@ const PASTE_GRID_COLUMNS = [
   {
     field: 'priceBookId',
     header: 'Price book',
-    placeholder: 'Per-row override (optional)',
+    placeholder: 'Ignored on upload — use Commerce settings',
   },
 ];
 
@@ -124,17 +143,19 @@ function guessBrandFromProductName(name) {
 
 function defaultBrandAttributesArray(brandValue) {
   const v = String(brandValue || '').trim() || PASTE_GRID_DEFAULT_BRAND;
-  // Data Ingestion ProductAttribute: { code, values } only (see @adobe-commerce/aco-ts-sdk)
-  return [{ code: 'brand', values: [v] }];
+  return [{ code: 'brand', type: 'STRING', values: [v] }];
 }
 
 function defaultBrandAttributesJson(brandValue) {
   return JSON.stringify(defaultBrandAttributesArray(brandValue));
 }
 
+/** Allowed attribute `type` values for catalog ingestion (matches sample products.json). */
+const INGESTION_ATTRIBUTE_TYPES = new Set(['STRING', 'NUMBER', 'BOOLEAN', 'INTEGER', 'DECIMAL']);
+
 /**
- * Coerce paste / form / JSON attribute rows to ingestion ProductAttribute[] ({ code, values: string[] }).
- * Fixes scalar `values` (e.g. "Tide") which previously became [""], and drops non-schema fields like `type`.
+ * Coerce paste / form / JSON attribute rows to ingestion attributes: { code, type, values }.
+ * Fixes scalar `values` (e.g. "Tide") which previously became [""].
  */
 function normalizeAttributesForIngestion(rawList) {
   if (!Array.isArray(rawList) || rawList.length === 0) return [];
@@ -158,7 +179,10 @@ function normalizeAttributesForIngestion(rawList) {
     values = values.filter((s) => s !== '');
     if (!values.length) return;
 
-    out.push({ code, values });
+    const rawType = String(attr.type ?? 'STRING').trim().toUpperCase() || 'STRING';
+    const type = INGESTION_ATTRIBUTE_TYPES.has(rawType) ? rawType : 'STRING';
+
+    out.push({ code, type, values });
   });
   return out;
 }
@@ -172,7 +196,7 @@ function readLocalStorageTrimmed(key) {
   }
 }
 
-/** Default `priceBookId` for paste grid empty cells, add-product form, and initial catalog filter */
+/** Default `priceBookId` from Commerce settings: add-product form, paste-grid price upload, PLP filter default */
 function getDefaultPriceBook() {
   return readLocalStorageTrimmed(ACO_LS_KEYS.PRICE_BOOK_ID) || DEFAULT_PRICE_BOOK_FALLBACK;
 }
@@ -236,6 +260,7 @@ function buildAcoRuntimeConfig() {
     productsEndpoint: `${acoBaseUrl}/v1/catalog/products`,
     productsDeleteEndpoint: `${acoBaseUrl}/v1/catalog/products/delete`,
     pricesEndpoint: `${acoBaseUrl}/v1/catalog/products/prices`,
+    priceBooksEndpoint: `${acoBaseUrl}/v1/catalog/price-books`,
     imsTokenUrl,
     hasImsClientCredentials: Boolean(clientId && clientSecret),
   };
@@ -310,12 +335,16 @@ async function requestAccessToken() {
  * Requests a new token via IMS if none exists and credentials are configured
  */
 async function ensureAccessToken() {
+  purgeExpiredIngestionTokenIfNeeded();
   if (!accessToken) {
-    if (acoRuntime.hasImsClientCredentials) {
+    const storedIngestion = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+    if (storedIngestion) {
+      accessToken = storedIngestion;
+    } else if (acoRuntime.hasImsClientCredentials) {
       accessToken = await requestAccessToken();
     } else {
       throw new Error(
-        'No access token available. Use Commerce settings for CLIENT_ID and CLIENT_SECRET, or open this tool signed in with DA.',
+        'No access token available. Use Commerce settings: Retrieve bearer token (CLIENT_ID) or paste INGESTION_ACCESS_TOKEN, or open this tool signed in with DA.',
       );
     }
   }
@@ -328,6 +357,7 @@ async function ensureAccessToken() {
  * Pasted INGESTION_ACCESS_TOKEN wins (browser IMS client_credentials is often blocked by CORS).
  */
 async function getBearerForCatalogWrite() {
+  purgeExpiredIngestionTokenIfNeeded();
   const pastedIngestion = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
   if (pastedIngestion) return pastedIngestion;
 
@@ -337,8 +367,7 @@ async function getBearerForCatalogWrite() {
   await ensureAccessToken();
   if (!accessToken) {
     throw new Error(
-      'No access token for catalog writes. Add INGESTION_ACCESS_TOKEN (Generate Access Token in Developer Console) '
-        + 'or CLIENT_ID plus CLIENT_SECRET (token exchange must run outside the browser if CORS blocks IMS).',
+      'No access token for catalog writes. In Commerce settings use Retrieve bearer token (CLIENT_ID → Fusion) or paste INGESTION_ACCESS_TOKEN.',
     );
   }
   return accessToken;
@@ -519,6 +548,7 @@ function createIcon(name) {
     close: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
     delete: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
     clipboard: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg>`,
+    trash: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>`,
     settings: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>`,
   };
   const span = document.createElement('span');
@@ -1243,7 +1273,8 @@ function buildPayloadsFromPasteGridRow(product) {
     routes,
     images,
   });
-  const priceBookId = product.priceBookId?.trim() || getDefaultPriceBook();
+  // Price ingestion always uses PRICE_BOOK_ID from Commerce settings (not per-row grid cells).
+  const priceBookId = getDefaultPriceBook();
   const pricePayload = buildPricePayload(product.sku, product.price || '0', priceBookId);
   return { productPayload, pricePayload };
 }
@@ -1278,6 +1309,148 @@ function closeIngestionJsonPreviewModal() {
   modal.classList.remove('is-open');
   const pasteOpen = document.getElementById('paste-product-modal')?.classList.contains('is-open');
   document.body.style.overflow = pasteOpen ? 'hidden' : '';
+}
+
+function isAnyProductToolModalOpen() {
+  return Boolean(
+    document.getElementById('paste-product-modal')?.classList.contains('is-open')
+      || document.getElementById('add-product-modal')?.classList.contains('is-open')
+      || document.getElementById('aco-settings-modal')?.classList.contains('is-open')
+      || document.getElementById('edit-product-modal')?.classList.contains('is-open')
+      || document.getElementById('delete-by-sku-modal')?.classList.contains('is-open')
+      || document.getElementById('ingestion-json-preview-modal')?.classList.contains('is-open')
+      || document.getElementById('api-response-modal')?.classList.contains('is-open'),
+  );
+}
+
+function closeApiResponseModal() {
+  const modal = document.getElementById('api-response-modal');
+  if (!modal) return;
+  modal.classList.remove('is-open');
+  document.body.style.overflow = isAnyProductToolModalOpen() ? 'hidden' : '';
+}
+
+/**
+ * @param {{ title: string, subtitle?: string, bodyText: string }} opts
+ */
+function openApiResponseModal(opts) {
+  const modal = document.getElementById('api-response-modal');
+  if (!modal) return;
+  const titleEl = modal.querySelector('#api-response-modal-title');
+  const subEl = modal.querySelector('#api-response-modal-subtitle');
+  const pre = modal.querySelector('#api-response-modal-pre');
+  if (titleEl) titleEl.textContent = opts.title || 'API response';
+  if (subEl) {
+    const sub = opts.subtitle ?? '';
+    subEl.textContent = sub;
+    subEl.hidden = !sub;
+  }
+  if (pre) pre.textContent = opts.bodyText ?? '';
+  modal.classList.add('is-open');
+  document.body.style.overflow = 'hidden';
+}
+
+async function copyApiResponseModal() {
+  const pre = document.getElementById('api-response-modal')?.querySelector('#api-response-modal-pre');
+  const btn = document.getElementById('api-response-modal-copy');
+  if (!pre) return;
+  try {
+    await navigator.clipboard.writeText(pre.textContent);
+    if (btn) {
+      const prev = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(() => {
+        btn.textContent = prev;
+      }, 1800);
+    }
+  } catch (e) {
+    console.warn('Clipboard failed:', e);
+    alert('Could not copy to clipboard.');
+  }
+}
+
+function createApiResponseModal() {
+  const modal = document.createElement('div');
+  modal.id = 'api-response-modal';
+  modal.className = 'plp-modal plp-modal-json-preview';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'plp-modal-overlay';
+  overlay.addEventListener('click', closeApiResponseModal);
+
+  const dialog = document.createElement('div');
+  dialog.className = 'plp-modal-dialog plp-modal-dialog-xlarge plp-modal-dialog-json-preview';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-labelledby', 'api-response-modal-title');
+
+  const header = document.createElement('div');
+  header.className = 'plp-modal-header';
+
+  const title = document.createElement('h2');
+  title.id = 'api-response-modal-title';
+  title.className = 'plp-modal-title';
+  title.textContent = 'API response';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.className = 'plp-modal-close';
+  closeBtn.setAttribute('aria-label', 'Close modal');
+  closeBtn.appendChild(createIcon('close'));
+  closeBtn.addEventListener('click', closeApiResponseModal);
+
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+
+  const body = document.createElement('div');
+  body.className = 'plp-modal-body plp-json-preview-body';
+
+  const subtitle = document.createElement('p');
+  subtitle.id = 'api-response-modal-subtitle';
+  subtitle.className = 'plp-form-help plp-json-preview-hint';
+  subtitle.hidden = true;
+
+  const pre = document.createElement('pre');
+  pre.id = 'api-response-modal-pre';
+  pre.className = 'plp-json-preview-pre';
+  pre.setAttribute('tabindex', '0');
+
+  body.appendChild(subtitle);
+  body.appendChild(pre);
+
+  const footer = document.createElement('div');
+  footer.className = 'plp-modal-footer plp-json-preview-footer';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.id = 'api-response-modal-copy';
+  copyBtn.className = 'plp-button plp-button-secondary';
+  copyBtn.textContent = 'Copy';
+  copyBtn.addEventListener('click', () => copyApiResponseModal());
+
+  const closeFooterBtn = document.createElement('button');
+  closeFooterBtn.type = 'button';
+  closeFooterBtn.className = 'plp-button';
+  closeFooterBtn.textContent = 'Close';
+  closeFooterBtn.addEventListener('click', closeApiResponseModal);
+
+  footer.appendChild(copyBtn);
+  footer.appendChild(closeFooterBtn);
+
+  dialog.appendChild(header);
+  dialog.appendChild(body);
+  dialog.appendChild(footer);
+
+  modal.appendChild(overlay);
+  modal.appendChild(dialog);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal.classList.contains('is-open')) {
+      closeApiResponseModal();
+    }
+  });
+
+  return modal;
 }
 
 function openIngestionJsonPreview(kind) {
@@ -1426,6 +1599,64 @@ function createIngestionJsonPreviewModal() {
   return modal;
 }
 
+/**
+ * POST the paste grid’s price payloads in one request (same JSON as “View prices.json”).
+ */
+async function handlePasteModalSubmitPricesFromGrid() {
+  if (modalState.isSubmitting) return;
+
+  const { prices, errors } = buildIngestionPreviewFromPasteGrid();
+
+  if (!prices.length) {
+    alert(
+      errors.length
+        ? `No price rows to submit. Fix:\n${errors.join('\n')}`
+        : 'Fill the grid (SKU + name) so prices can be built, or use Parse Grid first.',
+    );
+    return;
+  }
+
+  if (errors.length) {
+    const proceed = window.confirm(
+      `${errors.length} row(s) were skipped (invalid JSON in columns, etc.). Submit ${prices.length} price row(s) anyway?`,
+    );
+    if (!proceed) return;
+  }
+
+  const pasteModal = document.getElementById('paste-product-modal');
+  const submitPricesBtn = pasteModal?.querySelector('.plp-paste-submit-prices-btn');
+
+  try {
+    modalState.isSubmitting = true;
+    if (submitPricesBtn) {
+      submitPricesBtn.disabled = true;
+      submitPricesBtn.textContent = 'Submitting prices…';
+    }
+
+    const result = await submitPricesBatchToACO(prices);
+    const errNote = errors.length ? ` · ${errors.length} grid row(s) skipped` : '';
+    openApiResponseModal({
+      title: 'Submit prices — API response',
+      subtitle: `Success · ${prices.length} row(s)${errNote}`,
+      bodyText: JSON.stringify(result, null, 2),
+    });
+  } catch (error) {
+    const detail =
+      `${error?.message || String(error)}${error?.cause ? `\n\ncause: ${error.cause}` : ''}`;
+    openApiResponseModal({
+      title: 'Submit prices — API error',
+      subtitle: `${prices.length} row(s) in body`,
+      bodyText: detail,
+    });
+  } finally {
+    modalState.isSubmitting = false;
+    if (submitPricesBtn) {
+      submitPricesBtn.disabled = false;
+      submitPricesBtn.textContent = 'Submit prices';
+    }
+  }
+}
+
 async function handlePasteSubmit() {
   if (modalState.isSubmitting) return;
 
@@ -1456,35 +1687,49 @@ async function handlePasteSubmit() {
 
     if (!accessToken) {
       throw new Error(
-        'No access token available. Use Commerce settings (CLIENT_ID / CLIENT_SECRET) or sign in with DA.',
+        'No access token available. Use Commerce settings (Retrieve bearer token or INGESTION_ACCESS_TOKEN) or sign in with DA.',
       );
     }
 
-    const failures = [];
-    let successCount = 0;
+    const batchReport = {
+      summary: { total: gridProducts.length, succeeded: 0, failed: 0 },
+      results: [],
+    };
 
     // Submit products sequentially so one bad row does not stop all rows
     for (const product of gridProducts) {
       try {
         const { productPayload, pricePayload } = buildPayloadsFromPasteGridRow(product);
-        await submitProductToACO(productPayload, pricePayload);
-        successCount += 1;
+        const apiResult = await submitProductToACO(productPayload, pricePayload);
+        batchReport.summary.succeeded += 1;
+        batchReport.results.push({
+          sku: product.sku,
+          status: 'success',
+          response: apiResult,
+        });
       } catch (error) {
-        failures.push({ product, error: error.message || String(error) });
+        batchReport.summary.failed += 1;
+        batchReport.results.push({
+          sku: product.sku,
+          status: 'failure',
+          error: error.message || String(error),
+        });
       }
     }
 
     closePasteModal();
 
-    if (failures.length === 0) {
-      showSuccessMessage(`Added ${successCount} products from pasted grid.`);
+    openApiResponseModal({
+      title: 'Paste grid — API responses',
+      subtitle: `${batchReport.summary.succeeded} succeeded · ${batchReport.summary.failed} failed · ${batchReport.summary.total} rows`,
+      bodyText: JSON.stringify(batchReport, null, 2),
+    });
+
+    if (batchReport.summary.failed === 0) {
+      showSuccessMessage(`Added ${batchReport.summary.succeeded} products from pasted grid.`);
     } else {
-      const failedPreview = failures
-        .slice(0, 5)
-        .map((f) => `${f.product.sku}: ${f.error}`)
-        .join('\n');
-      alert(
-        `Added ${successCount} products. ${failures.length} failed.\n\n${failedPreview}${failures.length > 5 ? '\n...' : ''}`,
+      showSuccessMessage(
+        `Added ${batchReport.summary.succeeded} of ${batchReport.summary.total}. See API response for failures.`,
       );
     }
 
@@ -1526,9 +1771,14 @@ function removeCommerceAppLocalStorageKeys() {
   });
 }
 
+/** Keys that count as “user configured commerce” (expiry alone does not). */
+function commerceLocalStorageKeysForPresence() {
+  return Object.values(ACO_LS_KEYS).filter((k) => k !== ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT);
+}
+
 /** True if this app has saved any Commerce Optimizer field (required before loading the catalog). */
 function hasAnyCommerceLocalStorage() {
-  return Object.values(ACO_LS_KEYS).some((key) => readLocalStorageTrimmed(key) !== '');
+  return commerceLocalStorageKeysForPresence().some((key) => readLocalStorageTrimmed(key) !== '');
 }
 
 /**
@@ -1665,18 +1915,20 @@ function fillAcoSettingsForm(form) {
     if (el) el.value = readLocalStorageTrimmed(key);
   };
   set('#aco-settings-client-id', ACO_LS_KEYS.CLIENT_ID);
-  set('#aco-settings-client-secret', ACO_LS_KEYS.CLIENT_SECRET);
   set('#aco-settings-ingestion-access-token', ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
   set('#aco-settings-tenant-id', ACO_LS_KEYS.TENANT_ID);
   set('#aco-settings-region', ACO_LS_KEYS.REGION);
   set('#aco-settings-environment', ACO_LS_KEYS.ENVIRONMENT);
   set('#aco-settings-catalog-view-id', ACO_LS_KEYS.CATALOG_VIEW_ID);
   set('#aco-settings-price-book-id', ACO_LS_KEYS.PRICE_BOOK_ID);
+  set('#aco-settings-price-book-name', ACO_LS_KEYS.PRICE_BOOK_NAME);
+  set('#aco-settings-price-book-currency', ACO_LS_KEYS.PRICE_BOOK_CURRENCY);
 }
 
 function openAcoSettingsModal() {
   const modal = document.getElementById('aco-settings-modal');
   if (modal) {
+    purgeExpiredIngestionTokenIfNeeded();
     modal.classList.add('is-open');
     document.body.style.overflow = 'hidden';
     const form = modal.querySelector('form');
@@ -1694,17 +1946,354 @@ function closeAcoSettingsModal() {
   }
 }
 
+function readExpiresInSecondsFromObject(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  const candidates = [obj.expires_in, obj.expiresIn, obj.expires];
+  for (const c of candidates) {
+    if (c == null) continue;
+    const n = Number(c);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+/**
+ * Parse Fusion / proxy JSON (or raw JWT) into token and optional expires_in (seconds, OAuth-style).
+ * @returns {{ token: string, expiresInSec: number | null }}
+ */
+function parseFusionTokenResponse(text) {
+  const trimmed = String(text ?? '').trim();
+  if (!trimmed) return { token: '', expiresInSec: null };
+  try {
+    const j = JSON.parse(trimmed);
+    if (typeof j === 'string') {
+      return { token: j.trim(), expiresInSec: null };
+    }
+    let expiresInSec =
+      readExpiresInSecondsFromObject(j)
+      || readExpiresInSecondsFromObject(j.body)
+      || readExpiresInSecondsFromObject(j.data);
+    const direct =
+      j.access_token
+      || j.accessToken
+      || j.token
+      || j.bearer
+      || (j.body && (j.body.access_token || j.body.token || j.body.accessToken));
+    if (typeof direct === 'string' && direct.trim()) {
+      return { token: direct.trim(), expiresInSec };
+    }
+    if (j.data && typeof j.data === 'object') {
+      const d = j.data.access_token || j.data.token || j.data.accessToken;
+      if (typeof d === 'string' && d.trim()) {
+        const innerExp =
+          readExpiresInSecondsFromObject(j.data) || (expiresInSec == null ? null : expiresInSec);
+        return { token: d.trim(), expiresInSec: innerExp };
+      }
+    }
+  } catch (_) {
+    /* fall through */
+  }
+  if (/^eyJ/i.test(trimmed)) return { token: trimmed, expiresInSec: null };
+  return { token: '', expiresInSec: null };
+}
+
+function extractAccessTokenFromHookResponseBody(text) {
+  return parseFusionTokenResponse(text).token;
+}
+
+/**
+ * If stored ingestion token is past INGESTION_ACCESS_TOKEN_EXPIRES_AT, remove it from localStorage.
+ * Clears in-memory accessToken when it matched the removed token. Syncs settings textarea if open.
+ * @returns {boolean} True when something was removed.
+ */
+function purgeExpiredIngestionTokenIfNeeded() {
+  const tok = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+  const expRaw = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT);
+  const expMs = expRaw ? Number(expRaw) : NaN;
+  const hasValidExpiry = Number.isFinite(expMs) && expMs > 0;
+  const expired = hasValidExpiry && Date.now() >= expMs;
+
+  if (!expired) {
+    if (!tok && hasValidExpiry) {
+      try {
+        localStorage.removeItem(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT);
+      } catch (e) {
+        console.warn('localStorage remove failed:', ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT, e);
+      }
+    }
+    return false;
+  }
+
+  try {
+    localStorage.removeItem(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+    localStorage.removeItem(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT);
+  } catch (e) {
+    console.warn('Could not clear expired ingestion token:', e);
+  }
+
+  if (accessToken && tok && accessToken === tok) {
+    accessToken = null;
+  }
+
+  const modal = document.getElementById('aco-settings-modal');
+  const ta = modal?.querySelector('#aco-settings-ingestion-access-token');
+  if (ta) ta.value = '';
+
+  return true;
+}
+
+/**
+ * POST { client_id } to Adobe Fusion hook; stores result in INGESTION_ACCESS_TOKEN and in-memory accessToken.
+ */
+async function retrieveBearerTokenViaFusion(form) {
+  const clientId = (form.querySelector('#aco-settings-client-id')?.value ?? '').trim();
+  if (!clientId) {
+    alert('Enter CLIENT_ID first.');
+    return;
+  }
+
+  purgeExpiredIngestionTokenIfNeeded();
+
+  const btn = form.querySelector('#aco-settings-retrieve-token-btn');
+  const prev = btn?.textContent;
+  try {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Retrieving...';
+    }
+
+    const res = await fetch(FUSION_INGESTION_TOKEN_HOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: clientId }),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`Token request failed: ${res.status} - ${text.slice(0, 400)}`);
+    }
+
+    const { token, expiresInSec } = parseFusionTokenResponse(text);
+    if (!token) {
+      throw new Error(
+        'Could not find a bearer token in the response. Expected JSON with access_token (or token), or a raw JWT string.',
+      );
+    }
+
+    persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN, token);
+    if (expiresInSec != null && Number.isFinite(expiresInSec) && expiresInSec > 0) {
+      const expiresAtMs = Date.now() + Math.floor(expiresInSec * 1000);
+      persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT, String(expiresAtMs));
+    } else {
+      persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT, '');
+    }
+    const ta = form.querySelector('#aco-settings-ingestion-access-token');
+    if (ta) ta.value = token;
+    accessToken = token;
+    acoRuntime = buildAcoRuntimeConfig();
+
+    const listContainer = document.getElementById('product-list-container');
+    if (listContainer) renderAcoConfigBanner(listContainer);
+
+    showSuccessMessage('Bearer token saved to INGESTION_ACCESS_TOKEN.');
+  } catch (e) {
+    alert(e?.message || String(e));
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = prev || 'Retrieve bearer token';
+    }
+  }
+}
+
+/**
+ * Build FeedPricebook body from current Commerce settings form values (aco-ts-sdk shape).
+ */
+function buildFeedPricebookFromSettingsForm(form) {
+  const val = (sel) => (form.querySelector(sel)?.value ?? '').trim();
+  const priceBookId = val('#aco-settings-price-book-id') || getDefaultPriceBook();
+  if (!priceBookId) {
+    throw new Error('Set PRICE_BOOK_ID before creating a price book.');
+  }
+  const nameRaw = val('#aco-settings-price-book-name');
+  const name = nameRaw || priceBookId;
+  const curRaw = val('#aco-settings-price-book-currency');
+  const currency = (curRaw || DEFAULT_PRICE_BOOK_CURRENCY).toUpperCase();
+  return { priceBookId, name, currency };
+}
+
+/**
+ * POST …/v1/catalog/price-books — equivalent to @adobe-commerce/aco-ts-sdk createPriceBooks (REST only in this tool).
+ */
+async function submitPriceBooksToACO(priceBooks) {
+  const bearer = await getBearerForCatalogWrite();
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${bearer}`,
+  };
+  const response = await fetch(acoRuntime.priceBooksEndpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(priceBooks),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to create price books: ${response.status} - ${errorText}`);
+  }
+  return response.json();
+}
+
+/**
+ * Parse JSON like https://github.com/adobe-commerce/aco-sample-catalog-data-ingestion/blob/main/data/pricebooks.json
+ * @param {string} text
+ * @returns {Array<{ priceBookId: string, name: string, currency: string }>}
+ */
+function parsePriceBooksJsonText(text) {
+  const s = String(text ?? '').trim();
+  if (!s) throw new Error('Paste JSON or choose a pricebooks.json file.');
+  let parsed;
+  try {
+    parsed = JSON.parse(s);
+  } catch (e) {
+    throw new Error(`Invalid JSON: ${e.message}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(
+      'Expected a JSON array of price books (see aco-sample-catalog-data-ingestion data/pricebooks.json).',
+    );
+  }
+  const out = [];
+  parsed.forEach((row, i) => {
+    if (!row || typeof row !== 'object') {
+      throw new Error(`Index ${i}: expected an object with priceBookId, name, currency.`);
+    }
+    const priceBookId = String(row.priceBookId ?? '').trim();
+    if (!priceBookId) {
+      throw new Error(`Index ${i}: priceBookId is required.`);
+    }
+    const name = String(row.name ?? '').trim() || priceBookId;
+    const currency = String(row.currency ?? '').trim().toUpperCase() || DEFAULT_PRICE_BOOK_CURRENCY;
+    out.push({ priceBookId, name, currency });
+  });
+  return out;
+}
+
+function setPriceBooksIngestUiBusy(form, busy) {
+  if (!form) return;
+  const sel = [
+    '#aco-settings-ingest-pricebooks-paste-btn',
+    '#aco-settings-ingest-pricebooks-file-btn',
+    '#aco-settings-pricebooks-json-file',
+    '#aco-settings-create-price-book-btn',
+  ];
+  sel.forEach((q) => {
+    const el = form.querySelector(q);
+    if (el) el.disabled = busy;
+  });
+}
+
+async function handleAcoSettingsIngestPriceBooksJson(form, rawText) {
+  let priceBooks;
+  try {
+    priceBooks = parsePriceBooksJsonText(rawText);
+  } catch (e) {
+    alert(e?.message || String(e));
+    return;
+  }
+  if (!priceBooks.length) {
+    alert('The array is empty.');
+    return;
+  }
+
+  setPriceBooksIngestUiBusy(form, true);
+  const report = {
+    batchSize: PRICE_BOOKS_INGEST_BATCH_SIZE,
+    total: priceBooks.length,
+    batches: [],
+  };
+  try {
+    for (let i = 0; i < priceBooks.length; i += PRICE_BOOKS_INGEST_BATCH_SIZE) {
+      const batch = priceBooks.slice(i, i + PRICE_BOOKS_INGEST_BATCH_SIZE);
+      const batchNumber = Math.floor(i / PRICE_BOOKS_INGEST_BATCH_SIZE) + 1;
+      const response = await submitPriceBooksToACO(batch);
+      report.batches.push({ batchNumber, count: batch.length, response });
+    }
+    openApiResponseModal({
+      title: 'Ingest price books — API responses',
+      subtitle: `${report.total} item(s) · ${report.batches.length} batch(es) · up to ${PRICE_BOOKS_INGEST_BATCH_SIZE} per request`,
+      bodyText: JSON.stringify(report, null, 2),
+    });
+  } catch (error) {
+    openApiResponseModal({
+      title: 'Ingest price books — API error',
+      subtitle: error?.message || String(error),
+      bodyText: JSON.stringify(
+        {
+          completedBatchesBeforeFailure: report.batches,
+          note: 'Batches are applied in order; later batches did not run after this error.',
+          error: error?.message || String(error),
+        },
+        null,
+        2,
+      ),
+    });
+  } finally {
+    setPriceBooksIngestUiBusy(form, false);
+  }
+}
+
+async function handleAcoSettingsCreatePriceBook(form, btn) {
+  if (!form || !btn) return;
+  const prev = btn.textContent;
+  let payload = null;
+  try {
+    try {
+      payload = buildFeedPricebookFromSettingsForm(form);
+    } catch (e) {
+      alert(e?.message || String(e));
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Creating…';
+    const result = await submitPriceBooksToACO([payload]);
+    openApiResponseModal({
+      title: 'Create price book — API response',
+      subtitle: `Success · ${payload.priceBookId}`,
+      bodyText: JSON.stringify(result, null, 2),
+    });
+  } catch (error) {
+    const detail =
+      `${error?.message || String(error)}${error?.cause ? `\n\ncause: ${error.cause}` : ''}`;
+    openApiResponseModal({
+      title: 'Create price book — API error',
+      subtitle: payload?.priceBookId ?? '',
+      bodyText: detail,
+    });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prev || 'Create price book';
+  }
+}
+
 async function handleAcoSettingsSubmit(form) {
   const val = (sel) => (form.querySelector(sel)?.value ?? '').trim();
 
+  const prevIngestionTok = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+  const newIngestionTok = val('#aco-settings-ingestion-access-token');
+
   persistLocalStorageTrimmed(ACO_LS_KEYS.CLIENT_ID, val('#aco-settings-client-id'));
-  persistLocalStorageTrimmed(ACO_LS_KEYS.CLIENT_SECRET, val('#aco-settings-client-secret'));
-  persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN, val('#aco-settings-ingestion-access-token'));
+  persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN, newIngestionTok);
+  if (!newIngestionTok) {
+    persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT, '');
+  } else if (newIngestionTok !== prevIngestionTok) {
+    persistLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN_EXPIRES_AT, '');
+  }
   persistLocalStorageTrimmed(ACO_LS_KEYS.TENANT_ID, val('#aco-settings-tenant-id'));
   persistLocalStorageTrimmed(ACO_LS_KEYS.REGION, val('#aco-settings-region'));
   persistLocalStorageTrimmed(ACO_LS_KEYS.ENVIRONMENT, val('#aco-settings-environment'));
   persistLocalStorageTrimmed(ACO_LS_KEYS.CATALOG_VIEW_ID, val('#aco-settings-catalog-view-id'));
   persistLocalStorageTrimmed(ACO_LS_KEYS.PRICE_BOOK_ID, val('#aco-settings-price-book-id'));
+  persistLocalStorageTrimmed(ACO_LS_KEYS.PRICE_BOOK_NAME, val('#aco-settings-price-book-name'));
+  persistLocalStorageTrimmed(ACO_LS_KEYS.PRICE_BOOK_CURRENCY, val('#aco-settings-price-book-currency'));
 
   acoRuntime = buildAcoRuntimeConfig();
 
@@ -1719,6 +2308,9 @@ async function handleAcoSettingsSubmit(form) {
     } catch (e) {
       console.warn('Could not refresh IMS token after settings save:', e);
     }
+  } else {
+    const ingSaved = val('#aco-settings-ingestion-access-token');
+    if (ingSaved) accessToken = ingSaved;
   }
 
   const listContainer = document.getElementById('product-list-container');
@@ -1738,7 +2330,7 @@ async function handleAcoSettingsSubmit(form) {
 async function handleClearAppLocalStorage() {
   if (
     !confirm(
-      'Remove all Commerce Optimizer settings saved by this tool (CLIENT_ID, CLIENT_SECRET, INGESTION_ACCESS_TOKEN, TENANT_ID, REGION, ENVIRONMENT, CATALOG_VIEW_ID, PRICE_BOOK_ID)? Other sites’ localStorage data will not be touched.',
+      'Remove all Commerce Optimizer settings saved by this tool (CLIENT_ID, CLIENT_SECRET, INGESTION_ACCESS_TOKEN, token expiry, TENANT_ID, REGION, ENVIRONMENT, CATALOG_VIEW_ID, PRICE_BOOK_ID, PRICE_BOOK_NAME, PRICE_BOOK_CURRENCY)? Other sites’ localStorage data will not be touched.',
     )
   ) {
     return;
@@ -1872,7 +2464,7 @@ function createAcoSettingsModal() {
   const intro = document.createElement('p');
   intro.className = 'plp-form-help plp-settings-intro';
   intro.textContent =
-    'Values are stored in localStorage under the same names as aco-sample-catalog-data-ingestion .env (plus PRICE_BOOK_ID and optional INGESTION_ACCESS_TOKEN). For catalog writes from this page, paste INGESTION_ACCESS_TOKEN from Developer Console (Generate Access Token)—the browser usually cannot call Adobe IMS for client_credentials due to CORS.';
+    'Values are stored in localStorage (CLIENT_ID, INGESTION_ACCESS_TOKEN, tenant/region/env, catalog view, price book id/name/currency). Use Retrieve bearer token to POST your CLIENT_ID to Fusion and fill INGESTION_ACCESS_TOKEN, or paste a token from Developer Console.';
 
   const form = document.createElement('form');
   form.className = 'plp-modal-form';
@@ -1902,25 +2494,41 @@ function createAcoSettingsModal() {
   createAcoSettingsField(form, {
     id: 'aco-settings-client-id',
     label: 'CLIENT_ID',
-    help: 'IMS OAuth client id from Adobe Developer Console (Server-to-Server).',
+    help: 'IMS OAuth client id from Adobe Developer Console (Server-to-Server). Used with Retrieve bearer token.',
     placeholder: 'my-client-id',
     autocomplete: 'username',
   });
-  createAcoSettingsField(form, {
-    id: 'aco-settings-client-secret',
-    label: 'CLIENT_SECRET',
-    type: 'password',
-    help: 'IMS client secret. Stored only in this browser’s localStorage.',
-    placeholder: '••••••••',
-    autocomplete: 'current-password',
+
+  const retrieveGroup = document.createElement('div');
+  retrieveGroup.className = 'plp-form-group';
+  const retrieveLab = document.createElement('label');
+  retrieveLab.className = 'plp-form-label';
+  retrieveLab.setAttribute('for', 'aco-settings-retrieve-token-btn');
+  retrieveLab.textContent = 'Bearer token';
+  const retrieveHelp = document.createElement('p');
+  retrieveHelp.className = 'plp-form-help';
+  retrieveHelp.textContent =
+    'POSTs { client_id } to Adobe Fusion and saves the returned bearer into INGESTION_ACCESS_TOKEN. If the response includes expires_in (seconds), the token is removed from localStorage automatically after that time.';
+  const retrieveBtn = document.createElement('button');
+  retrieveBtn.type = 'button';
+  retrieveBtn.id = 'aco-settings-retrieve-token-btn';
+  retrieveBtn.className = 'plp-button plp-button-secondary';
+  retrieveBtn.textContent = 'Retrieve bearer token';
+  retrieveBtn.addEventListener('click', async () => {
+    await retrieveBearerTokenViaFusion(form);
   });
+  retrieveGroup.appendChild(retrieveLab);
+  retrieveGroup.appendChild(retrieveHelp);
+  retrieveGroup.appendChild(retrieveBtn);
+  form.appendChild(retrieveGroup);
+
   createAcoSettingsField(form, {
     id: 'aco-settings-ingestion-access-token',
     label: 'INGESTION_ACCESS_TOKEN',
     textarea: true,
     rows: 4,
     help:
-      'Optional. Bearer for Data Ingestion REST (commerce.aco.ingestion). Required for paste/submit from the browser: Developer Console → your Ingestion API → OAuth Server-to-Server → Generate Access Token. Valid ~24h; leave empty if you only use non-browser token exchange.',
+      'Bearer for Data Ingestion REST (commerce.aco.ingestion). Filled by Retrieve bearer token or paste from Developer Console → Generate Access Token.',
     placeholder: 'Paste bearer token (eyJ…)',
   });
   createAcoSettingsField(form, {
@@ -1951,9 +2559,109 @@ function createAcoSettingsModal() {
     id: 'aco-settings-price-book-id',
     label: 'PRICE_BOOK_ID',
     help:
-      'Default price book id sent with price ingestion (paste grid row override optional). Same identifier used as ac-price-book-id when browsing products.',
+      'Id used for price ingestion and PLP filter (ac-price-book-id). This book must already exist in your catalog, or create it below via Data Ingestion (same as @adobe-commerce/aco-ts-sdk createPriceBooks). Per-row Price book column is not used on upload.',
     placeholder: DEFAULT_PRICE_BOOK_FALLBACK,
   });
+  createAcoSettingsField(form, {
+    id: 'aco-settings-price-book-name',
+    label: 'PRICE_BOOK_NAME',
+    help:
+      'Optional display name when creating the price book via API. If empty, the id above is used as the name.',
+    placeholder: 'e.g. Default price book',
+  });
+  createAcoSettingsField(form, {
+    id: 'aco-settings-price-book-currency',
+    label: 'PRICE_BOOK_CURRENCY',
+    help: `ISO currency for Create price book (defaults to ${DEFAULT_PRICE_BOOK_CURRENCY} if empty).`,
+    placeholder: DEFAULT_PRICE_BOOK_CURRENCY,
+  });
+
+  const priceBookApiGroup = document.createElement('div');
+  priceBookApiGroup.className = 'plp-form-group';
+  const priceBookApiLab = document.createElement('label');
+  priceBookApiLab.className = 'plp-form-label';
+  priceBookApiLab.setAttribute('for', 'aco-settings-create-price-book-btn');
+  priceBookApiLab.textContent = 'Price book (Data Ingestion)';
+  const priceBookApiHelp = document.createElement('p');
+  priceBookApiHelp.className = 'plp-form-help';
+  priceBookApiHelp.textContent =
+    'POSTs one FeedPricebook to …/v1/catalog/price-books using PRICE_BOOK_ID, PRICE_BOOK_NAME, and PRICE_BOOK_CURRENCY from the fields above (saved values are not required—current field values are used). Requires ingestion bearer. For many books at once, use Ingest price books (pricebooks.json) below—same as aco-sample-catalog-data-ingestion index.js ingestPriceBooks.';
+  const createPriceBookBtn = document.createElement('button');
+  createPriceBookBtn.type = 'button';
+  createPriceBookBtn.id = 'aco-settings-create-price-book-btn';
+  createPriceBookBtn.className = 'plp-button plp-button-secondary';
+  createPriceBookBtn.textContent = 'Create price book';
+  createPriceBookBtn.addEventListener('click', async () => {
+    await handleAcoSettingsCreatePriceBook(form, createPriceBookBtn);
+  });
+  priceBookApiGroup.appendChild(priceBookApiLab);
+  priceBookApiGroup.appendChild(priceBookApiHelp);
+  priceBookApiGroup.appendChild(createPriceBookBtn);
+  form.appendChild(priceBookApiGroup);
+
+  const priceBooksJsonGroup = document.createElement('div');
+  priceBooksJsonGroup.className = 'plp-form-group';
+  const priceBooksJsonLab = document.createElement('label');
+  priceBooksJsonLab.className = 'plp-form-label';
+  priceBooksJsonLab.setAttribute('for', 'aco-settings-pricebooks-json-paste');
+  priceBooksJsonLab.textContent = 'Ingest price books (pricebooks.json)';
+  const priceBooksJsonHelp = document.createElement('p');
+  priceBooksJsonHelp.className = 'plp-form-help';
+  priceBooksJsonHelp.textContent =
+    'Same JSON array as aco-sample-catalog-data-ingestion data/pricebooks.json (priceBookId, name, currency per row). POSTed in batches of 100 to …/v1/catalog/price-books, matching the sample repo createPriceBooks loop.';
+  const priceBooksJsonTa = document.createElement('textarea');
+  priceBooksJsonTa.id = 'aco-settings-pricebooks-json-paste';
+  priceBooksJsonTa.className = 'plp-form-input plp-form-textarea';
+  priceBooksJsonTa.rows = 5;
+  priceBooksJsonTa.spellcheck = false;
+  priceBooksJsonTa.placeholder =
+    '[ { "priceBookId": "west_coast_inc", "name": "West coast Inc. price book", "currency": "USD" }, … ]';
+  const priceBooksIngestRow = document.createElement('div');
+  priceBooksIngestRow.className = 'plp-settings-pricebooks-ingest-row';
+  const ingestPriceBooksPasteBtn = document.createElement('button');
+  ingestPriceBooksPasteBtn.type = 'button';
+  ingestPriceBooksPasteBtn.id = 'aco-settings-ingest-pricebooks-paste-btn';
+  ingestPriceBooksPasteBtn.className = 'plp-button plp-button-secondary';
+  ingestPriceBooksPasteBtn.textContent = 'Ingest pasted JSON';
+  ingestPriceBooksPasteBtn.addEventListener('click', async () => {
+    const ta = form.querySelector('#aco-settings-pricebooks-json-paste');
+    await handleAcoSettingsIngestPriceBooksJson(form, ta?.value ?? '');
+  });
+  const pricebooksJsonFileInput = document.createElement('input');
+  pricebooksJsonFileInput.type = 'file';
+  pricebooksJsonFileInput.id = 'aco-settings-pricebooks-json-file';
+  pricebooksJsonFileInput.accept = 'application/json,.json';
+  pricebooksJsonFileInput.setAttribute('aria-hidden', 'true');
+  pricebooksJsonFileInput.tabIndex = -1;
+  pricebooksJsonFileInput.style.cssText = 'position:absolute;width:0;height:0;opacity:0;';
+  pricebooksJsonFileInput.addEventListener('change', async (ev) => {
+    const input = ev.target;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    let text;
+    try {
+      text = await file.text();
+    } catch (e) {
+      alert(e?.message || String(e));
+      return;
+    }
+    await handleAcoSettingsIngestPriceBooksJson(form, text);
+  });
+  const ingestPriceBooksFileBtn = document.createElement('button');
+  ingestPriceBooksFileBtn.type = 'button';
+  ingestPriceBooksFileBtn.id = 'aco-settings-ingest-pricebooks-file-btn';
+  ingestPriceBooksFileBtn.className = 'plp-button plp-button-secondary';
+  ingestPriceBooksFileBtn.textContent = 'Choose pricebooks.json & ingest';
+  ingestPriceBooksFileBtn.addEventListener('click', () => pricebooksJsonFileInput.click());
+  priceBooksIngestRow.appendChild(ingestPriceBooksPasteBtn);
+  priceBooksIngestRow.appendChild(ingestPriceBooksFileBtn);
+  priceBooksIngestRow.appendChild(pricebooksJsonFileInput);
+  priceBooksJsonGroup.appendChild(priceBooksJsonLab);
+  priceBooksJsonGroup.appendChild(priceBooksJsonHelp);
+  priceBooksJsonGroup.appendChild(priceBooksJsonTa);
+  priceBooksJsonGroup.appendChild(priceBooksIngestRow);
+  form.appendChild(priceBooksJsonGroup);
 
   const footer = document.createElement('div');
   footer.className = 'plp-modal-footer plp-settings-modal-footer';
@@ -2176,10 +2884,33 @@ async function updateProductInACO(productPayload) {
 }
 
 /**
- * Delete product via ACO API
- * POST https://na1-sandbox.api.commerce.adobe.com/{{tenantId}}/v1/catalog/products/delete
+ * Parse comma- or newline-separated SKU text into a deduplicated ordered list.
  */
-async function deleteProductFromACO(sku) {
+function parseSkuListFromInput(raw) {
+  const text = String(raw ?? '');
+  const parts = text.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  parts.forEach((sku) => {
+    if (!seen.has(sku)) {
+      seen.add(sku);
+      out.push(sku);
+    }
+  });
+  return out;
+}
+
+/**
+ * Delete one or more products via ACO API
+ * POST https://na1-sandbox.api.commerce.adobe.com/{{tenantId}}/v1/catalog/products/delete
+ * @param {string[]} skus Non-empty list of SKUs
+ */
+async function deleteProductsFromACO(skus) {
+  const list = Array.isArray(skus) ? skus.map((s) => String(s).trim()).filter(Boolean) : [];
+  if (!list.length) {
+    throw new Error('No SKUs to delete.');
+  }
+
   const bearer = await getBearerForCatalogWrite();
 
   console.log('=== DELETE REQUEST ===');
@@ -2190,17 +2921,15 @@ async function deleteProductFromACO(sku) {
     Authorization: `Bearer ${bearer}`,
   };
 
-  const deletePayload = [
-    {
-      sku,
-      source: {
-        locale: DEFAULT_LOCALE,
-      },
+  const deletePayload = list.map((sku) => ({
+    sku,
+    source: {
+      locale: DEFAULT_LOCALE,
     },
-  ];
+  }));
 
   try {
-    console.log('Deleting product from ACO...', deletePayload);
+    console.log('Deleting product(s) from ACO...', deletePayload);
     console.log('DELETE URL:', acoRuntime.productsDeleteEndpoint);
 
     const response = await fetch(acoRuntime.productsDeleteEndpoint, {
@@ -2212,7 +2941,7 @@ async function deleteProductFromACO(sku) {
     if (!response.ok) {
       const errorText = await response.text();
       console.error('Product delete failed:', errorText);
-      throw new Error(`Failed to delete product: ${response.status} - ${errorText}`);
+      throw new Error(`Failed to delete product(s): ${response.status} - ${errorText}`);
     }
 
     const result = await response.json();
@@ -2220,9 +2949,13 @@ async function deleteProductFromACO(sku) {
 
     return result;
   } catch (error) {
-    console.error('Error deleting product from ACO:', error);
+    console.error('Error deleting product(s) from ACO:', error);
     throw error;
   }
+}
+
+async function deleteProductFromACO(sku) {
+  return deleteProductsFromACO([sku]);
 }
 
 /**
@@ -2259,6 +2992,173 @@ async function handleProductDelete(product, cardElement) {
     cardElement.classList.remove('plp-card-deleting');
     alert(`Failed to delete product: ${error.message}`);
   }
+}
+
+function closeDeleteBySkuModal() {
+  const modal = document.getElementById('delete-by-sku-modal');
+  if (modal) {
+    modal.classList.remove('is-open');
+    document.body.style.overflow = '';
+    const input = modal.querySelector('#delete-by-sku-input');
+    if (input) input.value = '';
+  }
+}
+
+function openDeleteBySkuModal() {
+  const modal = document.getElementById('delete-by-sku-modal');
+  if (modal) {
+    modal.classList.add('is-open');
+    document.body.style.overflow = 'hidden';
+    const input = modal.querySelector('#delete-by-sku-input');
+    if (input) {
+      input.focus();
+      input.select();
+    }
+  }
+}
+
+async function handleDeleteBySkuFormSubmit(form) {
+  const input = form.querySelector('#delete-by-sku-input');
+  const skus = parseSkuListFromInput(input?.value ?? '');
+  if (!skus.length) {
+    alert('Enter one or more SKUs (comma-separated).');
+    return;
+  }
+
+  const previewLimit = 12;
+  const preview =
+    skus.length <= previewLimit
+      ? skus.join(', ')
+      : `${skus.slice(0, previewLimit).join(', ')} … +${skus.length - previewLimit} more`;
+  const noun = skus.length === 1 ? 'product' : `${skus.length} products`;
+  if (!confirm(`Delete ${noun} from catalog?\n\nSKUs: ${preview}\n\nThis cannot be undone.`)) {
+    return;
+  }
+
+  const submitBtn = form.querySelector('button[type="submit"]');
+  const prev = submitBtn?.textContent;
+  try {
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Deleting...';
+    }
+    await deleteProductsFromACO(skus);
+    showSuccessMessage(skus.length === 1 ? `Product ${skus[0]} deleted.` : `Deleted ${skus.length} products.`);
+    closeDeleteBySkuModal();
+    state.currentPage = 1;
+    await loadProducts();
+  } catch (error) {
+    alert(error?.message || String(error));
+  } finally {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = prev || 'Delete';
+    }
+  }
+}
+
+function createDeleteBySkuModal() {
+  const modal = document.createElement('div');
+  modal.id = 'delete-by-sku-modal';
+  modal.className = 'plp-modal';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'plp-modal-overlay';
+  overlay.addEventListener('click', closeDeleteBySkuModal);
+
+  const dialog = document.createElement('div');
+  dialog.className = 'plp-modal-dialog plp-modal-dialog-small';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-labelledby', 'delete-by-sku-modal-title');
+
+  const header = document.createElement('div');
+  header.className = 'plp-modal-header';
+
+  const title = document.createElement('h2');
+  title.id = 'delete-by-sku-modal-title';
+  title.className = 'plp-modal-title';
+  title.textContent = 'Delete products by SKU';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.className = 'plp-modal-close';
+  closeBtn.setAttribute('aria-label', 'Close modal');
+  closeBtn.appendChild(createIcon('close'));
+  closeBtn.addEventListener('click', closeDeleteBySkuModal);
+
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+
+  const body = document.createElement('div');
+  body.className = 'plp-modal-body';
+
+  const help = document.createElement('p');
+  help.className = 'plp-form-help';
+  help.textContent =
+    `Enter one SKU or a comma-separated list (newlines also OK). Same Data Ingestion API and auth as Paste Product Grid. Locale ${DEFAULT_LOCALE}.`;
+
+  const form = document.createElement('form');
+  form.className = 'plp-modal-form';
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    await handleDeleteBySkuFormSubmit(form);
+  });
+
+  const group = document.createElement('div');
+  group.className = 'plp-form-group';
+
+  const lab = document.createElement('label');
+  lab.className = 'plp-form-label';
+  lab.setAttribute('for', 'delete-by-sku-input');
+  lab.textContent = 'SKU(s)';
+
+  const skuInput = document.createElement('textarea');
+  skuInput.id = 'delete-by-sku-input';
+  skuInput.className = 'plp-form-textarea';
+  skuInput.rows = 4;
+  skuInput.spellcheck = false;
+  skuInput.autocomplete = 'off';
+  skuInput.placeholder = 'e.g. prod6283422, sku-two, sku-three';
+
+  group.appendChild(lab);
+  group.appendChild(skuInput);
+  form.appendChild(group);
+
+  const footer = document.createElement('div');
+  footer.className = 'plp-modal-footer';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'plp-button plp-modal-cancel';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', closeDeleteBySkuModal);
+
+  const deleteBtn = document.createElement('button');
+  deleteBtn.type = 'submit';
+  deleteBtn.className = 'plp-button plp-button-danger';
+  deleteBtn.textContent = 'Delete';
+
+  footer.appendChild(cancelBtn);
+  footer.appendChild(deleteBtn);
+  form.appendChild(footer);
+
+  body.appendChild(help);
+  body.appendChild(form);
+
+  dialog.appendChild(header);
+  dialog.appendChild(body);
+
+  modal.appendChild(overlay);
+  modal.appendChild(dialog);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal.classList.contains('is-open')) {
+      closeDeleteBySkuModal();
+    }
+  });
+
+  return modal;
 }
 
 /**
@@ -2398,7 +3298,7 @@ function createPasteModal() {
   pasteTextarea.className = 'plp-form-input plp-form-textarea plp-form-textarea-large plp-paste-modal-textarea';
   pasteTextarea.placeholder =
     'Paste objects like data/products.json from aco-sample-catalog-data-ingestion (array of FeedProduct JSON). '
-    + 'Prices often live in a separate file — set Price / Price book columns before submit.\n\n'
+    + 'Prices often live in a separate file — set Price per row; price book id comes from Commerce settings PRICE_BOOK_ID (that book must exist—use Create price book in settings if needed).\n\n'
     + 'Or paste HTML with repeated product cards / rows.';
   pasteTextarea.rows = 14;
 
@@ -2437,7 +3337,7 @@ function createPasteModal() {
   const tableHelp = document.createElement('p');
   tableHelp.className = 'plp-form-help';
   tableHelp.textContent =
-    'Columns mirror ingestion JSON (sku, source.locale, slug, status, descriptions, visibleIn, metaTags, attributes[], images[], links[], routes[]) plus price fields. Edit cells, then Add Products.';
+    'Columns mirror ingestion JSON (sku, source.locale, slug, status, descriptions, visibleIn, metaTags, attributes[], images[], links[], routes[]) plus price. Price book on upload is always PRICE_BOOK_ID from Commerce settings—that id must exist in the catalog (Commerce settings → Create price book, Admin, or other ingestion). Edit cells, then Add Products. Use Submit prices to POST the same array as View prices.json (products/prices ingestion) without re-uploading products.';
 
   const gridWrap = document.createElement('div');
   gridWrap.className = 'plp-paste-grid-wrap';
@@ -2492,8 +3392,19 @@ function createPasteModal() {
   viewPricesBtn.textContent = 'View prices.json';
   viewPricesBtn.addEventListener('click', () => openIngestionJsonPreview('prices'));
 
+  const submitPricesBtn = document.createElement('button');
+  submitPricesBtn.type = 'button';
+  submitPricesBtn.className = 'plp-button plp-button-secondary plp-paste-submit-prices-btn';
+  submitPricesBtn.textContent = 'Submit prices';
+  submitPricesBtn.title =
+    'POST …/v1/catalog/products/prices with the current grid’s price rows (same JSON as View prices.json). PRICE_BOOK_ID must already exist. Does not create or update products.';
+  submitPricesBtn.addEventListener('click', () => {
+    handlePasteModalSubmitPricesFromGrid();
+  });
+
   footerLeft.appendChild(viewProductsBtn);
   footerLeft.appendChild(viewPricesBtn);
+  footerLeft.appendChild(submitPricesBtn);
 
   const footerRight = document.createElement('div');
   footerRight.className = 'plp-modal-footer-group';
@@ -2744,7 +3655,7 @@ function buildProductPayload(formData) {
     }
   }
 
-  // Attributes: { code, values } per Data Ingestion / aco-ts-sdk ProductAttribute
+  // Attributes: { code, type, values } (aligned with aco-sample-catalog-data-ingestion products.json)
   const normalizedAttrs = normalizeAttributesForIngestion(formData.attributes);
   if (normalizedAttrs.length > 0) {
     payload.attributes = normalizedAttrs;
@@ -2804,6 +3715,28 @@ function buildPricePayload(sku, price, priceBookId) {
  * POST …/{{tenantId}}/v1/catalog/products
  * POST …/{{tenantId}}/v1/catalog/products/prices
  */
+async function submitPricesBatchToACO(pricePayloads) {
+  const bearer = await getBearerForCatalogWrite();
+
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${bearer}`,
+  };
+
+  const response = await fetch(acoRuntime.pricesEndpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(pricePayloads),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to create prices: ${response.status} - ${errorText}`);
+  }
+
+  return response.json();
+}
+
 async function submitProductToACO(productPayload, pricePayload) {
   const bearer = await getBearerForCatalogWrite();
 
@@ -2959,8 +3892,12 @@ async function handleProductSubmit(form) {
     const result = await submitProductToACO(productPayload, pricePayload);
     console.log('Product created successfully:', result);
 
-    // Success - close modal and refresh products
     closeModal();
+    openApiResponseModal({
+      title: 'Add product — API response',
+      subtitle: `Success · SKU ${formData.sku}`,
+      bodyText: JSON.stringify(result, null, 2),
+    });
     showSuccessMessage(`Product "${formData.name}" added successfully!`);
 
     // Refresh product list (note: ingestion is async, may take time to appear)
@@ -2968,7 +3905,13 @@ async function handleProductSubmit(form) {
     await loadProducts();
   } catch (error) {
     console.error('Failed to create product:', error);
-    showFormError(`Failed to create product: ${error.message}`);
+    const detail =
+      `${error?.message || String(error)}${error?.cause ? `\n\ncause: ${error.cause}` : ''}`;
+    openApiResponseModal({
+      title: 'Add product — API error',
+      subtitle: `Failed · SKU ${formData.sku}`,
+      bodyText: detail,
+    });
   } finally {
     modalState.isSubmitting = false;
     updateSubmitButton(false);
@@ -3711,12 +4654,23 @@ function renderHeader(container) {
   viewPricesJsonBtn.title = 'Preview price rows from the Paste Product Grid table';
   viewPricesJsonBtn.addEventListener('click', () => openIngestionJsonPreview('prices'));
 
+  const deleteBySkuBtn = document.createElement('button');
+  deleteBySkuBtn.type = 'button';
+  deleteBySkuBtn.className = 'plp-button plp-button-secondary';
+  deleteBySkuBtn.appendChild(createIcon('trash'));
+  const deleteBySkuBtnText = document.createElement('span');
+  deleteBySkuBtnText.textContent = 'Delete by SKU';
+  deleteBySkuBtn.appendChild(deleteBySkuBtnText);
+  deleteBySkuBtn.title =
+    'Delete one or more products by SKU (comma-separated list) via catalog ingestion (no search required)';
+  deleteBySkuBtn.addEventListener('click', openDeleteBySkuModal);
+
   const clearStorageBtn = document.createElement('button');
   clearStorageBtn.type = 'button';
   clearStorageBtn.className = 'plp-button plp-button-danger';
   clearStorageBtn.textContent = 'Clear app storage';
   clearStorageBtn.title =
-    'Remove CLIENT_ID, CLIENT_SECRET, INGESTION_ACCESS_TOKEN, TENANT_ID, REGION, ENVIRONMENT, CATALOG_VIEW_ID, and PRICE_BOOK_ID for this tool only';
+    'Remove CLIENT_ID, CLIENT_SECRET, INGESTION_ACCESS_TOKEN, token expiry, TENANT_ID, REGION, ENVIRONMENT, CATALOG_VIEW_ID, PRICE_BOOK_ID, PRICE_BOOK_NAME, and PRICE_BOOK_CURRENCY for this tool only';
   clearStorageBtn.addEventListener('click', async () => {
     try {
       await handleClearAppLocalStorage();
@@ -3729,6 +4683,7 @@ function renderHeader(container) {
   headerButtons.appendChild(pasteBtn);
   headerButtons.appendChild(viewProductsJsonBtn);
   headerButtons.appendChild(viewPricesJsonBtn);
+  headerButtons.appendChild(deleteBySkuBtn);
   headerButtons.appendChild(clearStorageBtn);
 
   headerTop.appendChild(headerText);
@@ -3981,6 +4936,8 @@ function renderProductListPage(container) {
 }
 
 function renderAcoConfigBanner(container) {
+  purgeExpiredIngestionTokenIfNeeded();
+
   const existing = container.querySelector('.plp-config-banner');
   if (existing) existing.remove();
 
@@ -3992,7 +4949,7 @@ function renderAcoConfigBanner(container) {
   }
   if (!accessToken) {
     lines.push(
-      'Open Commerce settings: add INGESTION_ACCESS_TOKEN or CLIENT_ID plus CLIENT_SECRET, or open this tool signed in with DA (DA token alone does not authorize catalog writes).',
+      'Open Commerce settings: use Retrieve bearer token (CLIENT_ID) or paste INGESTION_ACCESS_TOKEN, or sign in with DA (DA token alone does not authorize catalog writes).',
     );
   }
 
@@ -4021,6 +4978,7 @@ function renderAcoConfigBanner(container) {
 
 (async function init() {
   acoRuntime = buildAcoRuntimeConfig();
+  purgeExpiredIngestionTokenIfNeeded();
 
   const { context, token, actions } = await DA_SDK;
   console.log('DA SDK Context:', context);
@@ -4030,18 +4988,22 @@ function renderAcoConfigBanner(container) {
     if (token) {
       accessToken = token;
       console.log('Using DA SDK token');
-    } else {
+    } else if (acoRuntime.hasImsClientCredentials) {
       console.log('No DA SDK token, requesting from Adobe IMS...');
-      if (acoRuntime.hasImsClientCredentials) {
-        try {
-          accessToken = await requestAccessToken();
-          console.log('Using IMS access token');
-        } catch (error) {
-          console.error('Failed to get access token:', error);
-        }
+      try {
+        accessToken = await requestAccessToken();
+        console.log('Using IMS access token');
+      } catch (error) {
+        console.error('Failed to get access token:', error);
+      }
+    } else {
+      const storedIngestion = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+      if (storedIngestion) {
+        accessToken = storedIngestion;
+        console.log('Using INGESTION_ACCESS_TOKEN from localStorage');
       } else {
         console.warn(
-          'Skipping IMS token request: use Commerce settings to set CLIENT_ID and CLIENT_SECRET.',
+          'No token yet: use Commerce settings (Retrieve bearer token or paste INGESTION_ACCESS_TOKEN) or open with DA.',
         );
       }
     }
@@ -4063,6 +5025,9 @@ function renderAcoConfigBanner(container) {
         } catch (e) {
           console.warn('Could not refresh IMS token after sheet hydrate:', e);
         }
+      } else {
+        const ingAfterHydrate = readLocalStorageTrimmed(ACO_LS_KEYS.INGESTION_ACCESS_TOKEN);
+        if (ingAfterHydrate) accessToken = ingAfterHydrate;
       }
     }
   } catch (e) {
@@ -4102,8 +5067,14 @@ function renderAcoConfigBanner(container) {
   const ingestionJsonPreviewModal = createIngestionJsonPreviewModal();
   document.body.appendChild(ingestionJsonPreviewModal);
 
+  const apiResponseModal = createApiResponseModal();
+  document.body.appendChild(apiResponseModal);
+
   const editModal = createEditModal();
   document.body.appendChild(editModal);
+
+  const deleteBySkuModal = createDeleteBySkuModal();
+  document.body.appendChild(deleteBySkuModal);
 
   if (!hasAnyCommerceLocalStorage()) {
     openAcoSettingsModal();

@@ -1143,6 +1143,14 @@ body {
   margin-bottom: var(--spectrum-global-dimension-size-100);
 }
 
+.plp-settings-pricebooks-ingest-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spectrum-global-dimension-size-100);
+  align-items: center;
+  margin-top: var(--spectrum-global-dimension-size-75);
+}
+
 .plp-settings-modal-footer .plp-button:first-child {
   margin-right: auto;
 }
