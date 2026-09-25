@@ -1,4 +1,10 @@
 import DA_SDK from 'https://da.live/nx/utils/sdk.js';
+import {
+  DEFAULT_WALGREENS_FEED_URL,
+  buildDealOfWeekProductPayload,
+  matchWalgreensOffers,
+  normalizeWalgreensFeed,
+} from './walgreens-deals.js';
 
 /**
  * Same keys as aco-sample-catalog-data-ingestion `.env`, plus catalog view for GraphQL
@@ -2873,6 +2879,128 @@ async function updateProductInACO(productPayload) {
       throw new Error(`Failed to update product: ${response.status} - ${errorText}`);
     }
 
+    function createWalgreensDealsModal() {
+      const overlay = document.createElement('div');
+      overlay.className = 'plp-modal is-open';
+      overlay.innerHTML = `
+        <div class="plp-modal-overlay"></div>
+        <div class="plp-modal-dialog walgreens-deals-modal" role="dialog" aria-modal="true" aria-labelledby="walgreens-deals-title">
+          <div class="plp-modal-header">
+            <h2 id="walgreens-deals-title">Walgreens Deals of the Week</h2>
+            <button type="button" class="plp-modal-close" aria-label="Close">×</button>
+          </div>
+          <div class="plp-modal-body">
+            <label>Feed URL<input class="walgreens-feed-url" type="url"></label>
+            <label>Optional mapping JSON (offer key to existing SKU)
+              <textarea class="walgreens-mapping" rows="4" placeholder='{"offer-key":"existing-sku"}'></textarea>
+            </label>
+            <label>Or choose a mapping JSON file<input class="walgreens-mapping-file" type="file" accept="application/json,.json"></label>
+            <p class="walgreens-deals-help">Only the currently loaded products are matched. Headlines are never used as identity matches.</p>
+            <div class="walgreens-deals-status" role="status"></div>
+            <pre class="walgreens-deals-results"></pre>
+          </div>
+          <div class="plp-modal-footer">
+            <button type="button" class="plp-button plp-button-secondary walgreens-deals-cancel">Cancel</button>
+            <button type="button" class="plp-button plp-button-secondary walgreens-deals-load">Load preview</button>
+            <button type="button" class="plp-button plp-button-primary walgreens-deals-apply" disabled>Apply matched deals</button>
+          </div>
+        </div>`;
+      document.body.appendChild(overlay);
+      return overlay;
+    }
+
+    async function openWalgreensDealsModal() {
+      const modal = createWalgreensDealsModal();
+      const urlInput = modal.querySelector('.walgreens-feed-url');
+      const mappingInput = modal.querySelector('.walgreens-mapping');
+      const mappingFileInput = modal.querySelector('.walgreens-mapping-file');
+      const status = modal.querySelector('.walgreens-deals-status');
+      const results = modal.querySelector('.walgreens-deals-results');
+      const loadButton = modal.querySelector('.walgreens-deals-load');
+      const applyButton = modal.querySelector('.walgreens-deals-apply');
+      const close = () => modal.remove();
+      urlInput.value = DEFAULT_WALGREENS_FEED_URL;
+      let matches = [];
+
+      modal.querySelector('.plp-modal-close').addEventListener('click', close);
+      modal.querySelector('.walgreens-deals-cancel').addEventListener('click', close);
+      loadButton.addEventListener('click', async () => {
+        loadButton.disabled = true;
+        applyButton.disabled = true;
+        status.textContent = 'Loading and matching the feed…';
+        try {
+          const response = await fetch(urlInput.value.trim());
+          if (!response.ok) throw new Error(`Walgreens feed request failed: HTTP ${response.status}.`);
+          let feed;
+          try {
+            feed = await response.json();
+          } catch (error) {
+            throw new Error('Walgreens feed did not return valid JSON.', { cause: error });
+          }
+          const normalized = normalizeWalgreensFeed(feed);
+          let mappings = {};
+          if (mappingInput.value.trim() || mappingFileInput.files.length) {
+            try {
+              const mappingText = mappingFileInput.files.length
+                ? await mappingFileInput.files[0].text()
+                : mappingInput.value;
+              mappings = JSON.parse(mappingText);
+            } catch (error) {
+              throw new Error('Mapping JSON is invalid.', { cause: error });
+            }
+            if (!mappings || Array.isArray(mappings) || typeof mappings !== 'object') {
+              throw new Error('Mapping JSON must be an object of offer keys to existing SKUs.');
+            }
+          }
+          matches = matchWalgreensOffers(normalized.offers, state.products, mappings);
+          const counts = matches.reduce((summary, item) => {
+            summary[item.status] = (summary[item.status] || 0) + 1;
+            return summary;
+          }, {});
+          const unresolved = matches
+            .filter((item) => item.status !== 'matched')
+            .slice(0, 10)
+            .map((item) => `${item.status}: ${item.offer.key} — ${item.reason || item.offer.headline}`);
+          results.textContent = JSON.stringify({ counts, duplicates: normalized.duplicates.length, unresolved }, null, 2);
+          const matched = matches.filter((item) => item.status === 'matched');
+          applyButton.disabled = matched.length === 0;
+          status.textContent = `${matched.length} deterministic match(es) ready. Preview before applying.`;
+        } catch (error) {
+          status.textContent = error.message;
+          results.textContent = '';
+        } finally {
+          loadButton.disabled = false;
+        }
+      });
+      applyButton.addEventListener('click', async () => {
+        const matched = matches.filter((item) => item.status === 'matched');
+        if (!matched.length || !window.confirm(`Apply deal_of_the_week=true to ${matched.length} product(s)?`)) return;
+        applyButton.disabled = true;
+        loadButton.disabled = true;
+        const outcomes = await Promise.all(matched.map(async (item) => {
+          try {
+            await updateProductInACO(buildDealOfWeekProductPayload(item.product));
+            return { success: true };
+          } catch (error) {
+            return { success: false, sku: item.product.sku, error: error.message };
+          }
+        }));
+        const failures = outcomes.filter((outcome) => !outcome.success).map(({ sku, error }) => ({ sku, error }));
+        const succeeded = outcomes.filter((outcome) => outcome.success).length;
+        status.textContent = `Applied ${succeeded}; failed ${failures.length}.`;
+        results.textContent = JSON.stringify({
+          succeeded,
+          failures,
+          unmatched: matches.filter((item) => item.status === 'unmatched').map((item) => item.offer.key),
+          ambiguous: matches.filter((item) => item.status === 'ambiguous').map((item) => item.offer.key),
+          expired: matches.filter((item) => item.status === 'expired').map((item) => item.offer.key),
+          duplicates: matches.filter((item) => item.status === 'duplicate').map((item) => item.offer.key),
+        }, null, 2);
+        applyButton.disabled = false;
+        loadButton.disabled = false;
+      });
+    }
+
     const result = await response.json();
     console.log('Product update response:', result);
 
@@ -4640,6 +4768,13 @@ function renderHeader(container) {
   pasteBtn.appendChild(pasteBtnText);
   pasteBtn.addEventListener('click', openPasteModal);
 
+  const walgreensBtn = document.createElement('button');
+  walgreensBtn.type = 'button';
+  walgreensBtn.className = 'plp-button plp-button-secondary';
+  walgreensBtn.textContent = 'Load Walgreens Deals of the Week';
+  walgreensBtn.title = 'Preview and apply deterministic Walgreens offer matches';
+  walgreensBtn.addEventListener('click', openWalgreensDealsModal);
+
   const viewProductsJsonBtn = document.createElement('button');
   viewProductsJsonBtn.type = 'button';
   viewProductsJsonBtn.className = 'plp-button plp-button-secondary';
@@ -4681,6 +4816,7 @@ function renderHeader(container) {
 
   headerButtons.appendChild(settingsBtn);
   headerButtons.appendChild(pasteBtn);
+  headerButtons.appendChild(walgreensBtn);
   headerButtons.appendChild(viewProductsJsonBtn);
   headerButtons.appendChild(viewPricesJsonBtn);
   headerButtons.appendChild(deleteBySkuBtn);
