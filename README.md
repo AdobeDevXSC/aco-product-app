@@ -73,6 +73,23 @@ For projects that want a few more batteries. Built by the team who brought you d
 ### Operations
 * Cloudflare Worker reference implementation
 
+### Walgreens Deals of the Week importer
+
+The product tool's **Load Walgreens Deals of the Week** action reads the public feed
+at `https://www.walgreens.com/bin/search/articles/dow?categoryName=Deals+of+the+Week`.
+It previews normalized offers and only updates products already present on the current
+product page. Matching uses UPC/GTIN/barcode, APIWIC, WIC, then an optional mapping
+JSON object such as `{"offer-key":"existing-sku"}`; reliable feed SKUs are used last.
+Offer headlines are not identity matches. The action requires the same ACO ingestion
+permission and bearer token used by product PATCH operations and writes one
+`deal_of_the_week` `BOOLEAN` attribute with value `true`, preserving other attributes.
+
+Malformed feeds, duplicates, expired offers, unmatched offers, and ambiguous matches
+are shown in the preview and are not written. Reruns replace the existing attribute
+instead of duplicating it. The current tool does not maintain a trusted Walgreens
+source marker, so it intentionally does not clear stale attributes for products absent
+from a later feed; remove or change those attributes through the normal product editor.
+
 ## Patterns
 ### Page
 A page is what holds your content. It can be styled using a metadata property called `template` which will load styles that apply to the entire page.

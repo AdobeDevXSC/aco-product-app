@@ -166,6 +166,41 @@ body {
   margin-bottom: var(--spectrum-global-dimension-size-75);
 }
 
+.walgreens-deals-modal {
+  width: min(720px, calc(100vw - 32px));
+}
+
+.walgreens-deals-modal label {
+  display: block;
+  margin-bottom: var(--spectrum-global-dimension-size-200);
+  font-weight: 600;
+}
+
+.walgreens-deals-modal input,
+.walgreens-deals-modal textarea {
+  display: block;
+  width: 100%;
+  margin-top: var(--spectrum-global-dimension-size-75);
+  padding: var(--spectrum-global-dimension-size-100);
+  border: 1px solid var(--spectrum-alias-border-color);
+  border-radius: var(--spectrum-alias-border-radius-regular);
+  background: var(--spectrum-alias-background-color-default);
+  color: var(--spectrum-alias-text-color);
+  font: inherit;
+}
+
+.walgreens-deals-help {
+  color: var(--spectrum-alias-text-color-secondary);
+}
+
+.walgreens-deals-results {
+  max-height: 240px;
+  overflow: auto;
+  padding: var(--spectrum-global-dimension-size-150);
+  background: var(--spectrum-alias-background-color-secondary);
+  white-space: pre-wrap;
+}
+
 /* Header */
 .plp-header {
   padding: var(--spectrum-global-dimension-size-600) 0 var(--spectrum-global-dimension-size-400);
